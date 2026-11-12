@@ -30,8 +30,10 @@ PI3 = "Raspberry Pi 3 Model B Plus Rev 1.3"
 
 FAKE_SHIM = """#!/bin/sh
 {
-  printf '%s\\n' "$@"
+  for arg in "$@"; do printf 'ARG:%s\\n' "$arg"; done
   printf 'WAYLAND_DISPLAY=%s\\n' "${WAYLAND_DISPLAY-<unset>}"
+  printf 'DBUS_SESSION_BUS_ADDRESS=%s\\n' "${DBUS_SESSION_BUS_ADDRESS-<unset>}"
+  printf 'XDG_CACHE_HOME=%s\\n' "${XDG_CACHE_HOME-<unset>}"
 } > "$FAKE_SHIM_OUT"
 """
 
@@ -39,14 +41,19 @@ FAKE_SHIM = """#!/bin/sh
 class ConfigDB:
     """A loopback stand-in for config-server's /api/v1/key/<key>."""
 
-    def __init__(self, values):
+    def __init__(self, values, port=0):
         self.values = values
+        self.fail_with = None
         self.requests = []
         outer = self
 
         class Handler(http.server.BaseHTTPRequestHandler):
             def do_GET(self):
                 outer.requests.append(self.path)
+                if outer.fail_with:
+                    self.send_response(outer.fail_with)
+                    self.end_headers()
+                    return
                 prefix = "/api/v1/key/"
                 key = self.path[len(prefix):] if self.path.startswith(prefix) else None
                 if key not in outer.values:
@@ -64,7 +71,7 @@ class ConfigDB:
             def log_message(self, *args):
                 pass
 
-        self.server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        self.server = http.server.HTTPServer(("127.0.0.1", port), Handler)
         self.url = f"http://127.0.0.1:{self.server.server_port}"
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
@@ -164,6 +171,8 @@ class Tree:
             "JELLYFIN_VOLUME_SCRIPT": str(self.volume_target),
             "JELLYFIN_SHIM": str(self.shim),
             "FAKE_SHIM_OUT": str(self.shim_out),
+            # No retrying against an unreachable ConfigDB unless a test asks.
+            "JELLYFIN_CONFIGDB_WAIT": "0",
         }
 
     def run(self, *args, extra_env=None):
@@ -184,6 +193,9 @@ class Tree:
 
     def shim_record(self):
         return self.shim_out.read_text().splitlines()
+
+    def shim_argv(self):
+        return [l[4:] for l in self.shim_record() if l.startswith("ARG:")]
 
     def mpv_conf(self):
         return (self.conf_dir / "mpv.conf").read_text()
@@ -418,11 +430,46 @@ def test_unlimited_remote_unset_is_off(tree):
     assert tree.conf_json()["remote_kbps"] == 10000
 
 
-def test_unlimited_remote_configdb_unreachable_is_off(tree):
-    # tree.configdb_url points at a port nothing listens on.
+def test_unlimited_remote_configdb_unreachable_keeps_unlimited(tree):
+    # tree.configdb_url points at a port nothing listens on: the setting is
+    # unknown, which must not undo "on" (remote_kbps == local_kbps) on a boot
+    # where the player starts before config-server.
+    write_conf(tree, {"local_kbps": 50000, "remote_kbps": 50000})
+    tree.start()
+    assert tree.conf_json()["remote_kbps"] == 50000
+
+
+def test_unlimited_remote_configdb_unreachable_keeps_cap(tree):
     write_conf(tree, {"local_kbps": 50000, "remote_kbps": 10000})
     tree.start()
     assert tree.conf_json()["remote_kbps"] == 10000
+
+
+def test_unlimited_remote_configdb_unreachable_fresh_install(tree):
+    tree.start()
+    assert "remote_kbps" not in tree.conf_json()
+
+
+def test_unlimited_remote_configdb_server_error_keeps_value(tree):
+    tree.set_configdb({"player.jellyfin.unlimited_remote": "true"})
+    tree.configdb.fail_with = 500
+    write_conf(tree, {"local_kbps": 50000, "remote_kbps": 50000})
+    tree.start()
+    assert tree.conf_json()["remote_kbps"] == 50000
+
+
+def test_unlimited_remote_waits_for_configdb(tree):
+    # config-server comes up a moment after the player starts.
+    port = int(tree.configdb_url.rsplit(":", 1)[1])
+    timer = threading.Timer(1.0, lambda: setattr(
+        tree, "configdb",
+        ConfigDB({"player.jellyfin.unlimited_remote": "true"}, port=port)))
+    timer.start()
+    write_conf(tree, {"local_kbps": 50000, "remote_kbps": 10000})
+    result = tree.run(extra_env={"JELLYFIN_CONFIGDB_WAIT": "10"})
+    timer.join()
+    assert result.returncode == 0, result.stderr
+    assert tree.conf_json()["remote_kbps"] == 50000
 
 
 def test_dry_run_reports_conf_keys(tree):
@@ -521,8 +568,18 @@ def test_users_json_not_created(tree):
 
 def test_execs_shim_without_gui(tree):
     tree.start()
+    assert tree.shim_argv() == ["--no-gui"]
+
+
+def test_unit_environment_reaches_shim(tree):
+    bus = "unix:path=/run/dbus/system_bus_socket"
+    cache = "/tmp/jellyfin-mpv-shim/.cache"
+    result = tree.run(extra_env={"DBUS_SESSION_BUS_ADDRESS": bus,
+                                 "XDG_CACHE_HOME": cache})
+    assert result.returncode == 0, result.stderr
     record = tree.shim_record()
-    assert record[0] == "--no-gui"
+    assert f"DBUS_SESSION_BUS_ADDRESS={bus}" in record
+    assert f"XDG_CACHE_HOME={cache}" in record
 
 
 def test_dry_run_writes_nothing(tree):

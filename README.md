@@ -64,9 +64,12 @@ All of it lives in `~/.config/jellyfin-mpv-shim/` of the player user.
   RFC 1918 address; anything else, a VPN address included, is capped at
   `remote_kbps` (10 Mbit/s) and gets transcoded. When ConfigDB's
   `player.jellyfin.unlimited_remote` is `true`, `remote_kbps` is set to
-  `local_kbps`. When it is off -- unset, or config-server unreachable -- a
-  `remote_kbps` equal to `local_kbps` (what turning it on leaves behind) is put
-  back to 10000; any other value is left alone.
+  `local_kbps`. When it is off (`false`, or never set) a `remote_kbps` equal
+  to `local_kbps` (what turning it on leaves behind) is put back to 10000;
+  any other value is left alone. When config-server does not answer -- the
+  player can start before it on boot -- `start-jellyfin` retries for up to
+  10 s and then leaves `remote_kbps` exactly as it is, so the last known
+  setting stays in force rather than being read as off.
 - **`scripts/hifiberry-volume.lua`** is a symlink to
   `/usr/share/hifiberry-jellyfin/scripts/hifiberry-volume.lua`.
 - **`users.json`** holds the server token and belongs to the setup service;
@@ -91,7 +94,7 @@ python3 -m pytest tests/ -v
 `tests/test_start_jellyfin.py` runs `start-jellyfin` against a temporary tree;
 every device path is redirected through the environment (`JELLYFIN_CONF_DIR`,
 `JELLYFIN_DRM_ROOT`, `JELLYFIN_MODEL_FILE`, `XDG_RUNTIME_DIR`,
-`JELLYFIN_CONFIG_SERVER`, `JELLYFIN_CACHE_ROOT`, `JELLYFIN_SHARE_DIR`,
+`JELLYFIN_CONFIG_SERVER`, `JELLYFIN_CONFIGDB_WAIT`, `JELLYFIN_CACHE_ROOT`, `JELLYFIN_SHARE_DIR`,
 `JELLYFIN_VOLUME_SCRIPT`, `JELLYFIN_SHIM`). The package build runs the same
 suite.
 

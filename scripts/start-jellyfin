@@ -23,8 +23,8 @@ shim can create it 0700, so audiocontrol (another user) can read the covers.
 
 Every device path can be redirected through the environment, for tests:
 JELLYFIN_CONF_DIR, JELLYFIN_DRM_ROOT, JELLYFIN_MODEL_FILE, XDG_RUNTIME_DIR,
-JELLYFIN_CONFIG_SERVER, JELLYFIN_CACHE_ROOT, JELLYFIN_SHARE_DIR,
-JELLYFIN_VOLUME_SCRIPT, JELLYFIN_SHIM.
+JELLYFIN_CONFIG_SERVER, JELLYFIN_CONFIGDB_WAIT (seconds to retry it),
+JELLYFIN_CACHE_ROOT, JELLYFIN_SHARE_DIR, JELLYFIN_VOLUME_SCRIPT, JELLYFIN_SHIM.
 """
 
 import json
@@ -35,6 +35,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.error
 import urllib.request
 
@@ -52,7 +53,10 @@ VOLUME_SCRIPT = os.environ.get(
 SHIM = os.environ.get("JELLYFIN_SHIM", "/usr/lib/hifiberry-jellyfin/venv/bin/jellyfin-mpv-shim")
 
 UNLIMITED_REMOTE_KEY = "player.jellyfin.unlimited_remote"
-CONFIGDB_TIMEOUT = 3
+CONFIGDB_TIMEOUT = 2
+# How long to keep retrying a ConfigDB that does not answer (seconds).
+CONFIGDB_WAIT = float(os.environ.get("JELLYFIN_CONFIGDB_WAIT", "10"))
+CONFIGDB_RETRY_INTERVAL = 1
 
 # The display controller. On a Pi 4 v3d is also a DRM card, but render-only;
 # naming it as drm-device gives no picture.
@@ -212,24 +216,43 @@ def player_name():
             or "HiFiBerry")
 
 
-def unlimited_remote():
-    """The "Full quality over VPN" toggle. Unset or unreachable means off."""
+def _read_unlimited_remote():
+    """One attempt: True/False, or None when the answer is unknown."""
     url = f"{CONFIG_SERVER}/api/v1/key/{UNLIMITED_REMOTE_KEY}"
     try:
         with urllib.request.urlopen(url, timeout=CONFIGDB_TIMEOUT) as response:
             payload = json.loads(response.read().decode())
     except urllib.error.HTTPError as exc:
-        if exc.code != 404:
-            log(f"ConfigDB answered {exc.code} for {UNLIMITED_REMOTE_KEY}; "
-                "keeping the remote bitrate cap")
-        return False
-    except Exception as exc:  # noqa: BLE001 - any transport failure
-        log(f"ConfigDB unreachable ({exc}); keeping the remote bitrate cap")
-        return False
+        if exc.code == 404:
+            return False  # never set: the default, off
+        return None
+    except Exception:  # noqa: BLE001 - any transport failure
+        return None
     if not isinstance(payload, dict) or payload.get("status") != "success":
-        return False
+        return None
     value = (payload.get("data") or {}).get("value")
     return str(value).strip().lower() in ("true", "1", "yes", "on")
+
+
+def unlimited_remote():
+    """The "Full quality over VPN" toggle: True, False, or None if unknown.
+
+    Unknown -- config-server not answering -- is not the same as off. The
+    player's user unit is not ordered after config-server, so on some boots
+    it starts first; reading that as off would silently put the VPN cap back
+    for a user who turned it on. Retry for a while, then report unknown and
+    let the caller leave remote_kbps as it is.
+    """
+    deadline = time.monotonic() + CONFIGDB_WAIT
+    while True:
+        value = _read_unlimited_remote()
+        if value is not None:
+            return value
+        if time.monotonic() >= deadline:
+            log(f"ConfigDB did not answer for {UNLIMITED_REMOTE_KEY}; "
+                "leaving remote_kbps as it is")
+            return None
+        time.sleep(CONFIGDB_RETRY_INTERVAL)
 
 
 def load_conf(path):
@@ -249,7 +272,9 @@ def load_conf(path):
 def conf_updates(conf, name, unlimited):
     updates = dict(OWNED_KEYS, player_name=name)
     local = conf.get("local_kbps", SHIM_DEFAULT_LOCAL_KBPS)
-    if unlimited:
+    if unlimited is None:
+        pass  # unknown: whatever the last start decided stays in force
+    elif unlimited:
         # The shim counts only RFC 1918 servers as local; a server reached
         # over a VPN is "remote" and would be transcoded down to 10 Mbit/s.
         updates["remote_kbps"] = local
