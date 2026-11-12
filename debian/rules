@@ -1,5 +1,6 @@
 #!/usr/bin/make -f
 export DEB_BUILD_MAINT_OPTIONS = hardening=+all
+include /usr/share/dpkg/pkg-info.mk
 
 PKG := hifiberry-jellyfin
 DEST := debian/$(PKG)
@@ -15,8 +16,9 @@ override_dh_auto_build:
 
 override_dh_auto_test:
 	# Self-contained: start-jellyfin runs against a temporary tree with a
-	# loopback ConfigDB stub and a stand-in for the shim, so no network, no
-	# display and no sound card are involved.
+	# loopback ConfigDB stub and a stand-in for the shim, jellyfin-setup
+	# against loopback stubs of ConfigDB and a Jellyfin server, so no
+	# network, no display and no sound card are involved.
 	python3 -m pytest tests/ -v
 
 # The venv is built here rather than in dh_auto_build because dh_prep, at
@@ -25,6 +27,10 @@ override_dh_auto_install:
 	mkdir -p $(DEST)
 	cp -r data/* $(DEST)/
 	install -D -m0755 scripts/start-jellyfin $(DEST)/usr/bin/start-jellyfin
+	install -D -m0755 scripts/jellyfin-setup $(DEST)/usr/bin/jellyfin-setup
+	# The version jellyfin-setup reports to the WebUI and sends to the server.
+	sed -i 's/^VERSION = "unreleased"$$/VERSION = "$(DEB_VERSION)"/' $(DEST)/usr/bin/jellyfin-setup
+	grep -qx 'VERSION = "$(DEB_VERSION)"' $(DEST)/usr/bin/jellyfin-setup
 	# The shim and its dependencies, pinned and hash-checked. pip runs from
 	# the build host and installs into a venv that has no pip of its own, so
 	# none ends up on the device. --system-site-packages gives the shim
@@ -63,5 +69,8 @@ override_dh_auto_install:
 # HiFiBerryOS player: it ships disabled and the user turns it on from
 # Services > Players. Shipping it enabled would start a cast target that
 # nobody has signed in yet on every boot.
+# jellyfin-setup.service is enabled: the WebUI needs it to sign in, which
+# comes before the player can be turned on.
 override_dh_installsystemduser:
 	dh_installsystemduser --no-enable jellyfin.service
+	dh_installsystemduser jellyfin-setup.service

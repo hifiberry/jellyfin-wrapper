@@ -1,0 +1,791 @@
+#!/usr/bin/python3
+"""Sign-in and server discovery for the Jellyfin player, for the WebUI.
+
+Run by jellyfin-setup.service as the HiFiBerryOS player user, listening on
+127.0.0.1 only. nginx forwards /api/jellyfin/* here; config-server fetches
+/servers for the server drop-down.
+
+  GET    /status   what the player card shows: signed in or not, as whom
+  GET    /servers  Jellyfin servers found on the LAN: [{id, name, address}]
+  POST   /login    start Quick Connect: {code, expires_in}
+  GET    /login    poll it: {state, code, error}
+  DELETE /login    cancel it
+  POST   /logout   revoke the token, drop the credentials, restart the player
+
+The server comes from ConfigDB, read on every request:
+player.jellyfin.server_url (typed in by hand) wins over player.jellyfin.server
+(picked from /servers).
+
+Sign-in writes the credentials into the shim's users.json in the shape the
+shim's own --quick-connect leaves there. Jellyfin binds the token to the
+device id it was issued for, so every request to the server carries the
+device_id from users.json; a users.json that does not exist yet is created
+with a new one.
+
+The Quick Connect secret and the access token stay in this process and in
+users.json (mode 0600). They are never logged, never returned, and never
+put on a command line or into the environment.
+
+Overrides, for tests: JELLYFIN_CONF_DIR, JELLYFIN_CONFIG_SERVER,
+JELLYFIN_SYSTEMCTL_CMD, JELLYFIN_DISCOVERY_TARGET (host:port).
+"""
+
+import argparse
+import datetime
+import http.client
+import http.server
+import json
+import logging
+import os
+import shlex
+import socket
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import uuid
+
+# Replaced with the package version at build time (debian/rules).
+VERSION = "unreleased"
+
+DEFAULT_PORT = 3551
+CLIENT_NAME = "HiFiBerryOS"
+
+SERVER_KEY = "player.jellyfin.server"
+SERVER_URL_KEY = "player.jellyfin.server_url"
+CONFIGDB_TIMEOUT = 2
+
+SERVER_TIMEOUT = 5          # any request to the Jellyfin server
+STATUS_INFO_TIMEOUT = 2     # the server name shown in /status
+SERVER_INFO_TTL = 60        # how long that name is reused
+SERVER_INFO_FAIL_TTL = 30   # how long an unreachable server is not asked again
+
+LOGIN_EXPIRES_IN = 300
+
+DISCOVERY_MESSAGE = b"who is JellyfinServer?"
+DISCOVERY_TARGET = ("255.255.255.255", 7359)
+DISCOVERY_LISTEN = 2.0
+DISCOVERY_INTERVAL = 60
+# A server that misses a scan or two (UDP is lossy) stays listed this long.
+DISCOVERY_KEEP = 300
+# A /servers request starts a new scan if the last one is older than this.
+DISCOVERY_KICK_AFTER = 10
+
+NO_SERVER = "Choose a server first."
+NOT_REACHABLE = "Server not reachable"
+QC_DISABLED = "Quick Connect is disabled on the server"
+
+log = logging.getLogger("jellyfin-setup")
+
+
+class HTTPFailure(Exception):
+    """An answer for the WebUI: HTTP status and error message."""
+
+    def __init__(self, status, message):
+        super().__init__(message)
+        self.status = status
+        self.message = message
+
+
+class Unreachable(Exception):
+    pass
+
+
+# --- device -----------------------------------------------------------------
+
+def _first_line(cmd):
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    if out.returncode != 0:
+        return ""
+    lines = out.stdout.strip().splitlines()
+    return lines[0].strip() if lines else ""
+
+
+def player_name():
+    """The device name; the same source start-jellyfin uses for player_name."""
+    return (_first_line(["hostnamectl", "hostname", "--pretty"])
+            or _first_line(["hostname"])
+            or "HiFiBerry")
+
+
+def _header_value(value):
+    # Header values are latin-1 on the wire; Jellyfin URL-decodes them, which
+    # is how its own clients send names outside ASCII.
+    return urllib.parse.quote(str(value), safe=" !#$&'()*+,-./:;<=>?@[]^_`{|}~")
+
+
+# --- server address ---------------------------------------------------------
+
+def normalise_address(value):
+    """A base URL like http://192.0.2.10:8096, or None if there is none.
+
+    A bare host (typed in by hand) gets http:// and Jellyfin's port 8096.
+    """
+    if not isinstance(value, str):
+        return None
+    value = value.strip()
+    if not value:
+        return None
+    bare = "://" not in value
+    if bare:
+        value = "http://" + value
+    try:
+        parts = urllib.parse.urlsplit(value)
+        port = parts.port
+    except ValueError:
+        return None
+    if parts.scheme not in ("http", "https") or not parts.hostname:
+        return None
+    netloc = parts.netloc
+    if bare and port is None:
+        netloc += ":8096"
+    return urllib.parse.urlunsplit((parts.scheme, netloc, parts.path.rstrip("/"), "", ""))
+
+
+# --- discovery --------------------------------------------------------------
+
+def parse_discovery_reply(data):
+    """{id, name, address} from one reply datagram, or None if it is not one."""
+    try:
+        reply = json.loads(data.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        return None
+    if not isinstance(reply, dict):
+        return None
+    address, server_id = reply.get("Address"), reply.get("Id")
+    if not isinstance(address, str) or not address or not isinstance(server_id, str) or not server_id:
+        return None
+    name = reply.get("Name")
+    if not isinstance(name, str) or not name:
+        name = address
+    return {"id": server_id, "name": name, "address": address.rstrip("/")}
+
+
+def collect_servers(replies):
+    """Parsed replies, one per server id, sorted by name."""
+    found = {}
+    for data in replies:
+        entry = parse_discovery_reply(data)
+        if entry and entry["id"] not in found:
+            found[entry["id"]] = entry
+    return sorted(found.values(), key=lambda e: (e["name"].casefold(), e["address"]))
+
+
+def discover(target=DISCOVERY_TARGET, listen=DISCOVERY_LISTEN):
+    """Broadcast Jellyfin's discovery probe and collect replies for `listen` s."""
+    replies = []
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+            sock.sendto(DISCOVERY_MESSAGE, target)
+            deadline = time.monotonic() + listen
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                sock.settimeout(remaining)
+                try:
+                    data, _ = sock.recvfrom(4096)
+                except socket.timeout:
+                    break
+                replies.append(data)
+    except OSError as exc:
+        log.debug("discovery failed: %s", exc)
+    return collect_servers(replies)
+
+
+# --- users.json -------------------------------------------------------------
+
+def write_atomic(path, text, mode=0o600):
+    directory = os.path.dirname(path)
+    fd, tmp = tempfile.mkstemp(dir=directory, prefix=".jellyfin-setup-")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(text)
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def fresh_user():
+    return {
+        "id": str(uuid.uuid4()),
+        "name": "(default)",
+        "device_id": str(uuid.uuid4()),
+        "default": True,
+        "pin_hash": None,
+        "pin_salt": None,
+        "require_pin_startup": False,
+        "last_server": None,
+        "auto_download": None,
+        "credentials": [],
+    }
+
+
+def active_user(data):
+    users = [u for u in data.get("users") or [] if isinstance(u, dict)]
+    for user in users:
+        if user.get("id") == data.get("active"):
+            return user
+    for user in users:
+        if user.get("default"):
+            return user
+    return users[0] if users else None
+
+
+class UsersFile:
+    def __init__(self, conf_dir):
+        self.dir = conf_dir
+        self.path = os.path.join(conf_dir, "users.json")
+
+    def load(self):
+        """(data, state); state is 'ok', 'missing' or 'corrupt'."""
+        try:
+            with open(self.path) as f:
+                data = json.load(f)
+        except FileNotFoundError:
+            return None, "missing"
+        except (OSError, ValueError):
+            return None, "corrupt"
+        if not isinstance(data, dict) or not isinstance(data.get("users"), list):
+            return None, "corrupt"
+        return data, "ok"
+
+    def save(self, data):
+        os.makedirs(self.dir, mode=0o700, exist_ok=True)
+        write_atomic(self.path, json.dumps(data, indent=4) + "\n")
+
+    def ensure(self):
+        """(data, active user), creating users.json or its user if needed."""
+        data, state = self.load()
+        changed = False
+        if state == "corrupt":
+            os.replace(self.path, self.path + ".corrupt")
+            log.warning("users.json was not readable; moved it to users.json.corrupt")
+        if state != "ok":
+            data = {"users": []}
+            changed = True
+        user = active_user(data)
+        if user is None:
+            user = fresh_user()
+            data["users"].append(user)
+            data["active"] = user["id"]
+            changed = True
+        if not isinstance(user.get("credentials"), list):
+            user["credentials"] = []
+            changed = True
+        if not user.get("device_id"):
+            user["device_id"] = str(uuid.uuid4())
+            changed = True
+        if changed:
+            data.setdefault("active", user["id"])
+            # Key order as the shim writes it.
+            data = {"active": data["active"], **{k: v for k, v in data.items() if k != "active"}}
+            self.save(data)
+        return data, active_user(data)
+
+
+# --- talking to the Jellyfin server -----------------------------------------
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    # A redirect would carry the Authorization header, token and all, to
+    # wherever it points.
+    def redirect_request(self, *args, **kwargs):
+        return None
+
+
+_opener = urllib.request.build_opener(_NoRedirect)
+
+
+def auth_header(device_name, device_id, token=None):
+    header = (f'MediaBrowser Client="{CLIENT_NAME}", Device="{_header_value(device_name)}", '
+              f'DeviceId="{_header_value(device_id)}", Version="{_header_value(VERSION)}"')
+    if token:
+        header += f', Token="{token}"'
+    return header
+
+
+def server_request(base, method, path, *, authorization, body=None, timeout=SERVER_TIMEOUT):
+    """(status, decoded JSON or None). Raises Unreachable on transport errors.
+
+    Never puts the URL in an exception or a log line: the Quick Connect
+    secret travels in a query string.
+    """
+    data = None
+    headers = {"Authorization": authorization, "Accept": "application/json"}
+    if body is not None:
+        data = json.dumps(body).encode()
+        headers["Content-Type"] = "application/json"
+    elif method == "POST":
+        data = b""
+    request = urllib.request.Request(base + path, data=data, method=method, headers=headers)
+    try:
+        with _opener.open(request, timeout=timeout) as response:
+            status, raw = response.status, response.read()
+    except urllib.error.HTTPError as exc:
+        status, raw = exc.code, b""
+        exc.close()
+    except (urllib.error.URLError, OSError, http.client.HTTPException, ValueError) as exc:
+        raise Unreachable(type(exc).__name__) from None
+    try:
+        payload = json.loads(raw) if raw else None
+    except ValueError:
+        payload = None
+    return status, payload
+
+
+# --- the service ------------------------------------------------------------
+
+class Pending:
+    def __init__(self, server, info, device_id, secret, code, started):
+        self.server = server
+        self.info = info
+        self.device_id = device_id
+        self.secret = secret
+        self.code = code
+        self.started = started
+        self.state = "waiting"
+        self.error = None
+
+    def finish(self, state, error=None):
+        self.state = state
+        self.error = error
+        self.secret = None
+
+
+class SetupService:
+    def __init__(self, *, conf_dir, config_server, systemctl_cmd="systemctl --user",
+                 device_name=player_name, clock=time.monotonic, scan=discover):
+        self.users = UsersFile(conf_dir)
+        self.config_server = config_server.rstrip("/")
+        self.systemctl = shlex.split(systemctl_cmd)
+        self.device_name = device_name
+        self.clock = clock
+        self.scan = scan
+        self.server_timeout = SERVER_TIMEOUT
+
+        self.lock = threading.Lock()          # users.json and the pending login
+        self.pending = None
+        self.info_cache = {}                  # address -> (time, info or None)
+
+        self.servers_lock = threading.Lock()
+        self.servers = {}                     # id -> (entry, last seen)
+        self.last_scan = None
+        self.wake = threading.Event()
+        self.stopping = False
+        self.scanner = None
+
+    # -- discovery
+
+    def start(self):
+        self.scanner = threading.Thread(target=self._scan_loop, name="discovery", daemon=True)
+        self.scanner.start()
+
+    def stop(self):
+        self.stopping = True
+        self.wake.set()
+
+    def _scan_loop(self):
+        while not self.stopping:
+            try:
+                found = self.scan()
+            except Exception:  # noqa: BLE001 - keep discovering
+                log.exception("discovery scan failed")
+                found = []
+            now = time.monotonic()
+            with self.servers_lock:
+                for entry in found:
+                    self.servers[entry["id"]] = (entry, now)
+                for server_id, (_, seen) in list(self.servers.items()):
+                    if now - seen > DISCOVERY_KEEP:
+                        del self.servers[server_id]
+                self.last_scan = now
+            self.wake.wait(DISCOVERY_INTERVAL)
+            self.wake.clear()
+
+    def list_servers(self):
+        with self.servers_lock:
+            entries = [entry for entry, _ in self.servers.values()]
+            last = self.last_scan
+        if last is not None and time.monotonic() - last > DISCOVERY_KICK_AFTER:
+            self.wake.set()
+        return sorted(entries, key=lambda e: (e["name"].casefold(), e["address"]))
+
+    # -- settings
+
+    def _read_key(self, key):
+        """The value, None when unset; raises Unreachable if ConfigDB is down."""
+        url = f"{self.config_server}/api/v1/key/{key}"
+        try:
+            with urllib.request.urlopen(url, timeout=CONFIGDB_TIMEOUT) as response:
+                payload = json.loads(response.read().decode())
+        except urllib.error.HTTPError as exc:
+            exc.close()
+            if exc.code == 404:
+                return None
+            raise Unreachable("ConfigDB") from None
+        except Exception:  # noqa: BLE001 - any transport failure
+            raise Unreachable("ConfigDB") from None
+        if not isinstance(payload, dict) or payload.get("status") != "success":
+            return None
+        return (payload.get("data") or {}).get("value")
+
+    def server_address(self):
+        """The chosen server's base URL; the hand-typed one wins."""
+        try:
+            return (normalise_address(self._read_key(SERVER_URL_KEY))
+                    or normalise_address(self._read_key(SERVER_KEY)))
+        except Unreachable:
+            log.warning("ConfigDB did not answer; no server chosen")
+            return None
+
+    # -- systemd
+
+    def _systemctl(self, *args):
+        try:
+            return subprocess.run([*self.systemctl, *args], capture_output=True,
+                                  timeout=10).returncode
+        except (OSError, subprocess.SubprocessError) as exc:
+            log.warning("systemctl %s failed: %s", args[0], exc)
+            return None
+
+    def player_active(self):
+        return self._systemctl("is-active", "--quiet", "jellyfin.service") == 0
+
+    def restart_player_if_active(self):
+        if self.player_active():
+            log.info("restarting the player for the new credentials")
+            self._systemctl("restart", "--no-block", "jellyfin.service")
+
+    # -- server info
+
+    def _auth(self, device_id, token=None):
+        return auth_header(self.device_name(), device_id, token)
+
+    def _server_info(self, base, device_id, timeout):
+        status, info = server_request(base, "GET", "/System/Info/Public",
+                                      authorization=self._auth(device_id), timeout=timeout)
+        if status != 200 or not isinstance(info, dict) or not info.get("Id"):
+            return None
+        return info
+
+    def _cached_server_name(self, base, device_id):
+        now = self.clock()
+        cached = self.info_cache.get(base)
+        if cached:
+            when, info = cached
+            if now - when < (SERVER_INFO_TTL if info else SERVER_INFO_FAIL_TTL):
+                return info.get("ServerName") if info else None
+        try:
+            info = self._server_info(base, device_id, min(STATUS_INFO_TIMEOUT, self.server_timeout))
+        except Unreachable:
+            info = None
+        self.info_cache[base] = (now, info)
+        return info.get("ServerName") if info else None
+
+    # -- endpoints
+
+    def status(self):
+        server = self.server_address()
+        data, state = self.users.load()
+        credential, device_id = None, ""
+        if state == "ok":
+            user = active_user(data)
+            if user:
+                device_id = user.get("device_id") or ""
+                creds = [c for c in user.get("credentials") or []
+                         if isinstance(c, dict) and c.get("AccessToken")]
+                matching = [c for c in creds if normalise_address(c.get("address")) == server]
+                credential = (matching or creds or [None])[0]
+
+        account = server_name = None
+        if credential:
+            account = credential.get("username")
+            address = normalise_address(credential.get("address"))
+            live = self._cached_server_name(address, device_id) if address else None
+            server_name = live or credential.get("Name")
+
+        return {
+            "binary_installed": True,
+            "version": VERSION,
+            "build_date": None,
+            "expires_on": None,
+            "bridge_connected": True,
+            "logged_in": credential is not None,
+            "is_active": self.player_active(),
+            "device_name": self.device_name(),
+            "sign_in": {
+                "method": "quick_connect",
+                "account": account,
+                "server_name": server_name,
+                "ready": server is not None,
+                "reason": None if server is not None else NO_SERVER,
+            },
+        }
+
+    def start_login(self):
+        server = self.server_address()
+        if server is None:
+            raise HTTPFailure(409, NO_SERVER)
+        with self.lock:
+            self.pending = None
+            try:
+                _, user = self.users.ensure()
+            except OSError as exc:
+                log.error("could not write users.json: %s", exc)
+                raise HTTPFailure(500, "Could not save the sign-in data") from None
+            device_id = user["device_id"]
+            try:
+                info = self._server_info(server, device_id, self.server_timeout)
+                if info is None:
+                    log.warning("%s did not answer as a Jellyfin server", server)
+                    raise HTTPFailure(502, NOT_REACHABLE)
+                status, payload = server_request(server, "POST", "/QuickConnect/Initiate",
+                                                 authorization=self._auth(device_id),
+                                                 timeout=self.server_timeout)
+            except Unreachable as exc:
+                log.warning("%s not reachable (%s)", server, exc)
+                raise HTTPFailure(502, NOT_REACHABLE) from None
+            if status in (401, 403):
+                raise HTTPFailure(409, QC_DISABLED)
+            if (status != 200 or not isinstance(payload, dict)
+                    or not payload.get("Secret") or not payload.get("Code")):
+                log.warning("Quick Connect not started on %s (HTTP %s)", server, status)
+                raise HTTPFailure(502, "The server did not start Quick Connect")
+            self.pending = Pending(server, info, device_id, payload["Secret"],
+                                   str(payload["Code"]), self.clock())
+            log.info("Quick Connect started on %s", server)
+            return {"code": self.pending.code, "expires_in": LOGIN_EXPIRES_IN}
+
+    def poll_login(self):
+        with self.lock:
+            pending = self.pending
+            if pending is None:
+                return {"state": "idle", "code": None, "error": None}
+            if pending.state == "waiting":
+                self._advance(pending)
+            return {"state": pending.state, "code": pending.code, "error": pending.error}
+
+    def _advance(self, pending):
+        if self.clock() - pending.started >= LOGIN_EXPIRES_IN:
+            pending.finish("expired", "The code has expired.")
+            return
+        try:
+            status, payload = server_request(
+                pending.server, "GET",
+                "/QuickConnect/Connect?" + urllib.parse.urlencode({"secret": pending.secret}),
+                authorization=self._auth(pending.device_id), timeout=self.server_timeout)
+        except Unreachable:
+            return  # keep waiting; the next poll asks again
+        if status == 404:
+            pending.finish("expired", "The code has expired.")
+            return
+        if status != 200 or not isinstance(payload, dict) or payload.get("Authenticated") is not True:
+            return
+        self._complete(pending)
+
+    def _complete(self, pending):
+        try:
+            status, payload = server_request(
+                pending.server, "POST", "/Users/AuthenticateWithQuickConnect",
+                authorization=self._auth(pending.device_id),
+                body={"Secret": pending.secret}, timeout=self.server_timeout)
+        except Unreachable:
+            return  # approved but not collected yet; the next poll retries
+        user_info = payload.get("User") if isinstance(payload, dict) else None
+        token = payload.get("AccessToken") if isinstance(payload, dict) else None
+        if status != 200 or not token or not isinstance(user_info, dict) or not user_info.get("Id"):
+            log.warning("sign-in refused by %s (HTTP %s)", pending.server, status)
+            pending.finish("failed", "The server refused the sign-in.")
+            return
+
+        try:
+            data, user = self.users.ensure()
+            if user["device_id"] != pending.device_id:
+                # users.json was replaced while the code was pending; the
+                # token belongs to a device id the shim no longer uses.
+                pending.finish("failed", "Sign-in data changed meanwhile. Start again.")
+                return
+            info = pending.info
+            credential = {
+                "address": pending.server,
+                "Name": info.get("ServerName"),
+                "Id": info.get("Id"),
+                "Version": info.get("Version"),
+                "DateLastAccessed": datetime.datetime.now(datetime.timezone.utc)
+                .strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "UserId": user_info["Id"],
+                "AccessToken": token,
+                "Users": [{"Id": user_info["Id"], "IsSignedInOffline": True}],
+                "uuid": str(uuid.uuid4()),
+                "username": user_info.get("Name"),
+            }
+            user["credentials"] = [c for c in user["credentials"]
+                                   if not (isinstance(c, dict) and c.get("Id") == info.get("Id"))]
+            user["credentials"].append(credential)
+            self.users.save(data)
+        except OSError as exc:
+            log.error("could not write users.json: %s", exc)
+            pending.finish("failed", "Could not save the sign-in data.")
+            return
+        pending.finish("approved")
+        self.info_cache.pop(pending.server, None)
+        log.info("signed in as %s on %s", user_info.get("Name"), pending.server)
+        self.restart_player_if_active()
+
+    def cancel_login(self):
+        with self.lock:
+            self.pending = None
+        return {"state": "idle", "code": None, "error": None}
+
+    def logout(self):
+        removed = False
+        with self.lock:
+            self.pending = None
+            data, state = self.users.load()
+            if state == "ok":
+                for user in data["users"]:
+                    if not isinstance(user, dict):
+                        continue
+                    for cred in user.get("credentials") or []:
+                        self._revoke(cred, user.get("device_id") or "")
+                        removed = True
+                    user["credentials"] = []
+                if removed:
+                    try:
+                        self.users.save(data)
+                    except OSError as exc:
+                        log.error("could not write users.json: %s", exc)
+                        raise HTTPFailure(500, "Could not remove the sign-in data") from None
+            self.info_cache.clear()
+        if removed:
+            log.info("signed out")
+            self.restart_player_if_active()
+        return {"logged_in": False}
+
+    def _revoke(self, cred, device_id):
+        """Best effort: the token is dropped locally either way."""
+        address = normalise_address(cred.get("address")) if isinstance(cred, dict) else None
+        token = cred.get("AccessToken") if isinstance(cred, dict) else None
+        if not address or not token:
+            return
+        try:
+            status, _ = server_request(address, "POST", "/Sessions/Logout",
+                                       authorization=self._auth(device_id, token),
+                                       timeout=self.server_timeout)
+            if status >= 300:
+                log.info("%s did not revoke the token (HTTP %s)", address, status)
+        except Unreachable:
+            log.info("%s not reachable; token dropped locally only", address)
+
+
+# --- HTTP -------------------------------------------------------------------
+
+ROUTES = {
+    "/status": {"GET": SetupService.status},
+    "/servers": {"GET": SetupService.list_servers},
+    "/login": {"POST": SetupService.start_login, "GET": SetupService.poll_login,
+               "DELETE": SetupService.cancel_login},
+    "/logout": {"POST": SetupService.logout},
+}
+
+
+def make_server(service, host, port):
+    class Handler(http.server.BaseHTTPRequestHandler):
+        server_version = "jellyfin-setup"
+        sys_version = ""
+
+        def _dispatch(self):
+            length = int(self.headers.get("Content-Length") or 0)
+            if length:
+                self.rfile.read(min(length, 65536))
+            path = urllib.parse.urlsplit(self.path).path.rstrip("/") or "/"
+            methods = ROUTES.get(path)
+            if methods is None:
+                return self._send(404, {"error": "Not found"})
+            handler = methods.get(self.command)
+            if handler is None:
+                return self._send(405, {"error": "Method not allowed"})
+            try:
+                return self._send(200, handler(service))
+            except HTTPFailure as failure:
+                return self._send(failure.status, {"error": failure.message})
+            except Exception:  # noqa: BLE001 - answer, keep serving
+                log.exception("%s %s failed", self.command, path)
+                return self._send(500, {"error": "Internal error"})
+
+        do_GET = do_POST = do_DELETE = do_PUT = do_PATCH = _dispatch
+
+        def _send(self, status, payload):
+            data = json.dumps(payload).encode()
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def log_request(self, code="-", size="-"):
+            path = urllib.parse.urlsplit(self.path).path
+            log.debug("%s %s %s", self.command, path, code)
+
+        def log_error(self, format, *args):
+            log.warning(format, *args)
+
+    httpd = http.server.ThreadingHTTPServer((host, port), Handler)
+    httpd.daemon_threads = True
+    return httpd
+
+
+def _target(value):
+    host, _, port = value.rpartition(":")
+    return host, int(port)
+
+
+def main(argv):
+    parser = argparse.ArgumentParser(prog="jellyfin-setup")
+    parser.add_argument("--port", type=int, default=DEFAULT_PORT)
+    args = parser.parse_args(argv[1:])
+
+    logging.basicConfig(stream=sys.stderr, level=logging.INFO,
+                        format="jellyfin-setup: %(message)s")
+
+    conf_dir = os.environ.get(
+        "JELLYFIN_CONF_DIR",
+        os.path.join(os.path.expanduser("~"), ".config", "jellyfin-mpv-shim"))
+    target = os.environ.get("JELLYFIN_DISCOVERY_TARGET")
+    target = _target(target) if target else DISCOVERY_TARGET
+
+    service = SetupService(
+        conf_dir=conf_dir,
+        config_server=os.environ.get("JELLYFIN_CONFIG_SERVER", "http://127.0.0.1:1081"),
+        systemctl_cmd=os.environ.get("JELLYFIN_SYSTEMCTL_CMD", "systemctl --user"),
+        scan=lambda: discover(target=target),
+    )
+    httpd = make_server(service, "127.0.0.1", args.port)
+    service.start()
+    log.info("listening on 127.0.0.1:%d", args.port)
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        service.stop()
+        httpd.server_close()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

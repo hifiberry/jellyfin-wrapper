@@ -1,0 +1,32 @@
+{
+  "active": "00000000-0000-4000-8000-000000000001",
+  "users": [
+    {
+      "id": "00000000-0000-4000-8000-000000000001",
+      "name": "(default)",
+      "device_id": "00000000-0000-4000-8000-0000000000d1",
+      "default": true,
+      "pin_hash": null,
+      "pin_salt": null,
+      "require_pin_startup": false,
+      "last_server": null,
+      "auto_download": null,
+      "credentials": [
+        {
+          "address": "http://192.0.2.10:8096",
+          "Name": "Home",
+          "Id": "0123456789abcdef0123456789abcdef",
+          "Version": "12.4.0",
+          "DateLastAccessed": "2026-11-12T12:43:22Z",
+          "UserId": "fedcba9876543210fedcba9876543210",
+          "AccessToken": "FAKE-TOKEN-0000000000000000000000",
+          "Users": [
+            { "Id": "fedcba9876543210fedcba9876543210", "IsSignedInOffline": true }
+          ],
+          "uuid": "00000000-0000-4000-8000-0000000000c1",
+          "username": "alice"
+        }
+      ]
+    }
+  ]
+}

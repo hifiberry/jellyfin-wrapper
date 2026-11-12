@@ -16,6 +16,8 @@ HDMI when a display is connected.
 | `/usr/bin/start-jellyfin` | Prepares the shim's configuration, then execs it with `--no-gui`. |
 | `/usr/share/hifiberry-jellyfin/mpv.conf.{drm,wayland,audio}` | mpv templates. |
 | `/usr/lib/systemd/user/jellyfin.service` | The player. Ships disabled; toggled from Services > Players. |
+| `/usr/bin/jellyfin-setup` | Sign-in and server discovery for the WebUI, on 127.0.0.1:3551. |
+| `/usr/lib/systemd/user/jellyfin-setup.service` | Runs `jellyfin-setup`. Ships enabled. |
 
 ## The shim is vendored
 
@@ -85,12 +87,48 @@ All of it lives in `~/.config/jellyfin-mpv-shim/` of the player user.
 `WAYLAND_DISPLAY`, the conf.json keys it would set and the resulting
 `mpv.conf` as JSON, and changes nothing.
 
+## `jellyfin-setup`: signing in
+
+The player card in the WebUI signs the device in to a Jellyfin server with
+Quick Connect, so nobody has to type a password on the device. nginx forwards
+`/api/jellyfin/*` to `jellyfin-setup`, which listens on 127.0.0.1:3551 only:
+
+| Request | Answer |
+| --- | --- |
+| `GET /status` | `logged_in`, `is_active` (is `jellyfin.service` running), `device_name`, `version`, and `sign_in`: `{method: "quick_connect", account, server_name, ready, reason}`. `ready` is false, with `reason` "Choose a server first.", while no server is set. |
+| `GET /servers` | Servers found on the LAN, `[{id, name, address}]`. config-server uses it for the server drop-down. |
+| `POST /login` | Starts Quick Connect: `{code, expires_in: 300}`. 409 when no server is set or Quick Connect is disabled on the server, 502 when the server does not answer. |
+| `GET /login` | `{state, code, error}`, `state` one of `idle`, `waiting`, `approved`, `expired`, `failed`. Each poll asks the server whether the code was entered; once it was, the credentials are stored. |
+| `DELETE /login` | Cancels the pending code. |
+| `POST /logout` | Revokes the token on the server (best effort) and removes the stored credentials. |
+
+- **Which server**: ConfigDB's `player.jellyfin.server_url` (typed in by hand)
+  when it is set, otherwise `player.jellyfin.server` (picked from the
+  drop-down), read on every request. A bare host gets `http://` and port 8096.
+- **Discovery**: the Jellyfin probe `who is JellyfinServer?` broadcast to UDP
+  port 7359, answers collected for 2 s, at start and every 60 s in the
+  background. `/servers` answers from that list at once and never waits for
+  a scan. A server stays listed for 5 minutes after its last answer.
+- **Credentials** go into the shim's `users.json` in the shape the shim's own
+  `--quick-connect` writes, replacing any earlier entry for the same server.
+  Jellyfin ties a token to the device id it was issued for, so every request
+  to the server carries `users.json`'s `device_id`; when there is no
+  `users.json` yet, one is created with a new device id. After signing in or
+  out, `jellyfin.service` is restarted if it is running, so the shim picks up
+  the change.
+- **Secrets**: the Quick Connect secret and the access token are never
+  logged, never returned by any request and never passed on a command line;
+  `users.json` is mode 0600 in a 0700 directory.
+
 ## Tests
 
 ```sh
 python3 -m pytest tests/ -v
 ```
 
+`tests/test_jellyfin_setup.py` runs `jellyfin-setup` in-process against
+loopback stubs of ConfigDB and a Jellyfin server, with a stand-in for
+`systemctl` (`JELLYFIN_SYSTEMCTL_CMD`).
 `tests/test_start_jellyfin.py` runs `start-jellyfin` against a temporary tree;
 every device path is redirected through the environment (`JELLYFIN_CONF_DIR`,
 `JELLYFIN_DRM_ROOT`, `JELLYFIN_MODEL_FILE`, `XDG_RUNTIME_DIR`,

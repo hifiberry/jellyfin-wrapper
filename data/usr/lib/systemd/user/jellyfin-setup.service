@@ -1,0 +1,16 @@
+[Unit]
+Description=Jellyfin sign-in and server discovery for the WebUI
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Listens on 127.0.0.1 only; nginx forwards /api/jellyfin/* here and
+# config-server fetches /servers. It runs whether or not the player is
+# enabled, because signing in comes before turning the player on.
+ExecStart=/usr/bin/jellyfin-setup --port 3551
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target

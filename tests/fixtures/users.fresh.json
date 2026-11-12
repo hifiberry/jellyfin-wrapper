@@ -1,0 +1,17 @@
+{
+  "active": "00000000-0000-4000-8000-000000000001",
+  "users": [
+    {
+      "id": "00000000-0000-4000-8000-000000000001",
+      "name": "(default)",
+      "device_id": "00000000-0000-4000-8000-0000000000d1",
+      "default": true,
+      "pin_hash": null,
+      "pin_salt": null,
+      "require_pin_startup": false,
+      "last_server": null,
+      "auto_download": null,
+      "credentials": []
+    }
+  ]
+}

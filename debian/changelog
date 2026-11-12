@@ -11,5 +11,8 @@ hifiberry-jellyfin (0.1.0) trixie; urgency=medium
       remote bitrate cap from player.jellyfin.unlimited_remote, and the
       artwork cache audiocontrol reads
     - jellyfin.service, a systemd --user unit, disabled by default
+    - jellyfin-setup, enabled by default: signs the device in with Quick
+      Connect for the WebUI, finds Jellyfin servers on the LAN for the
+      server setting, and signs out again
 
  -- HiFiBerry <support@hifiberry.com>  Thu, 12 Nov 2026 12:00:00 +0000
