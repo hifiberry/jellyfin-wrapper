@@ -14,11 +14,13 @@
 # nothing behind it.
 #
 # Tiering (see /etc/hifiberry/auth.d/jellyfin-auth.json):
-#   - GET /status and GET /login are ok-tier: they report whether the device
-#     is signed in, to which server and account, and the state of a pending
-#     Quick Connect code. Never a token or the Quick Connect secret.
-#   - POST /login (start a sign-in), DELETE /login (cancel it) and
-#     POST /logout (revoke the token) change the device and are risky-tier.
+#   - GET /status is ok-tier: it reports whether the device is signed in,
+#     to which server and account. Never a token or the Quick Connect secret.
+#   - Everything else is risky-tier. POST /login (start a sign-in),
+#     DELETE /login (cancel it) and POST /logout (revoke the token) change
+#     the device. GET /login returns the pending Quick Connect code, which
+#     only the client that started the sign-in needs; as ok-tier, any client
+#     on the network could read it.
 
 location = /api/jellyfin/status {
     proxy_pass http://127.0.0.1:3551/status;

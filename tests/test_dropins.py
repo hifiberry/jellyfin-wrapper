@@ -215,7 +215,8 @@ def test_auth_manifest_shape():
 
 @pytest.mark.parametrize("method,path,tier", [
     ("GET", "/status", "ok"),
-    ("GET", "/login", "ok"),
+    # Only the client that started the sign-in needs the pending code.
+    ("GET", "/login", "risky"),
     ("POST", "/login", "risky"),
     ("DELETE", "/login", "risky"),
     ("POST", "/logout", "risky"),

@@ -23,7 +23,7 @@ HDMI when a display is connected.
 | `/etc/audiocontrol/players.d/jellyfin.json` | audiocontrol follows the shim over MPRIS on the system bus. |
 | `/etc/configserver/conf.d/jellyfin.json` | Lets the WebUI start and stop both units. |
 | `/etc/nginx/hifiberry-api.d/jellyfin.nginx` | `/api/jellyfin/{status,login,logout}` to `jellyfin-setup`, exact matches only. |
-| `/etc/hifiberry/auth.d/jellyfin-auth.json` | `GET /status` and `GET /login` without a password; signing in and out need one. |
+| `/etc/hifiberry/auth.d/jellyfin-auth.json` | `GET /status` without a password; everything else, polling a sign-in included, needs one. |
 
 ## The shim is vendored
 
