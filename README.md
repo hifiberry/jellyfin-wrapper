@@ -143,12 +143,12 @@ proxied:
 
 | Request | Answer |
 | --- | --- |
-| `GET /status` | `logged_in`, `is_active` (is `jellyfin.service` running), `device_name`, `version`, and `sign_in`: `{method: "quick_connect", account, server_name, ready, reason}`. `logged_in`, `account` and `server_name` describe the credential for the server chosen now (same address, or same server id); one for another server does not count. `ready` is false, with `reason` "Choose a server first.", while no server is set. |
+| `GET /status` | `logged_in`, `is_active` (is `jellyfin.service` running), `device_name`, `version`, and `sign_in`: `{method: "quick_connect", account, server_name, ready, reason, other_server}`. `logged_in` means signed in to the server chosen now (same address, or same server id). When the stored credential is for another server (or no server is chosen), `logged_in` is false, `other_server` is true and `account`/`server_name` name that credential, so the card can offer Sign out. `ready` is false, with `reason` "Choose a server first.", while no server is set. |
 | `GET /servers` | Servers found on the LAN, `[{id, name, address}]`. config-server uses it for the server drop-down. |
 | `POST /login` | Starts Quick Connect: `{code, expires_in: 300}`. 409 when no server is set or Quick Connect is disabled on the server, 502 when the server does not answer. |
 | `GET /login` | `{state, code, error}`, `state` one of `idle`, `waiting`, `approved`, `expired`, `failed`. Each poll asks the server whether the code was entered; once it was, the credentials are stored. |
 | `DELETE /login` | Cancels the pending code. |
-| `POST /logout` | Revokes the token on the server (best effort) and removes the stored credentials. |
+| `POST /logout` | Revokes the tokens on their servers (best effort) and removes every stored credential, from every copy of `users.json` (see below). |
 
 - **Which server**: ConfigDB's `player.jellyfin.server_url` (typed in by hand)
   when it is set, otherwise `player.jellyfin.server` (picked from the
@@ -158,7 +158,15 @@ proxied:
   background. `/servers` answers from that list at once and never waits for
   a scan. A server stays listed for 5 minutes after its last answer.
 - **Credentials** go into the shim's `users.json` in the shape the shim's own
-  `--quick-connect` writes, replacing any earlier entry for the same server.
+  `--quick-connect` writes. A sign-in replaces every stored credential, in
+  every profile: one device is one signed-in user on one server, and the shim
+  connects with every credential it finds, so one left behind for the
+  previous server would keep the device a cast target there.
+- **Copies of `users.json`**: the shim keeps `users.json.bak` and restores
+  from it when `users.json` is damaged, so `jellyfin-setup` writes the backup
+  together with the file. Signing out also rewrites the backup and removes
+  every other `users.json.*` beside it (the shim's `.tmp` and
+  `.unreadable-*` set-asides, `.corrupt`), so no token stays on disk.
   Jellyfin ties a token to the device id it was issued for, so every request
   to the server carries `users.json`'s `device_id`; when there is no
   `users.json` yet, a new device id is chosen and the file is created together

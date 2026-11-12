@@ -17,7 +17,9 @@ player.jellyfin.server_url (typed in by hand) wins over player.jellyfin.server
 (picked from /servers).
 
 Sign-in writes the credentials into the shim's users.json in the shape the
-shim's own --quick-connect leaves there. Jellyfin binds the token to the
+shim's own --quick-connect leaves there. One device is one signed-in user on
+one server: a sign-in replaces every stored credential, because the shim
+connects with all of them. Jellyfin binds the token to the
 device id it was issued for, so every request to the server carries the
 device_id from users.json; when there is no users.json yet, a new device id
 is chosen and the file is created with the credential. Nothing is written
@@ -38,6 +40,7 @@ JELLYFIN_SYSTEMCTL_CMD, JELLYFIN_DISCOVERY_TARGET (host:port).
 import argparse
 import contextlib
 import datetime
+import glob
 import http.client
 import http.server
 import json
@@ -255,10 +258,16 @@ def active_user(data):
     return users[0] if users else None
 
 
+# The shim writes this copy after every save of users.json and restores from
+# it when users.json is missing or damaged.
+BACKUP_SUFFIX = ".bak"
+
+
 class UsersFile:
     def __init__(self, conf_dir):
         self.dir = conf_dir
         self.path = os.path.join(conf_dir, "users.json")
+        self.backup = self.path + BACKUP_SUFFIX
 
     def load(self):
         """(data, state); state is 'ok', 'missing' or 'corrupt'."""
@@ -274,8 +283,32 @@ class UsersFile:
         return data, "ok"
 
     def save(self, data):
+        """users.json, then its backup, the way the shim saves them.
+
+        A backup left with older contents would be restored by the shim the
+        next time users.json is damaged -- credentials removed here back.
+        """
         os.makedirs(self.dir, mode=0o700, exist_ok=True)
-        write_atomic(self.path, json.dumps(data, indent=4) + "\n")
+        text = json.dumps(data, indent=4) + "\n"
+        write_atomic(self.path, text)
+        write_atomic(self.backup, text)
+
+    def scrub_leftovers(self):
+        """No copy of users.json may keep a token users.json no longer has.
+
+        The backup is rewritten from users.json (or removed when users.json
+        is unusable); everything else beside it -- the shim's .tmp and
+        .unreadable-* set-asides, our .corrupt -- is removed.
+        """
+        data, state = self.load()
+        for path in glob.glob(glob.escape(self.path) + ".*"):
+            try:
+                if path == self.backup and state == "ok":
+                    write_atomic(path, json.dumps(data, indent=4) + "\n")
+                else:
+                    os.unlink(path)
+            except OSError as exc:
+                log.error("could not clean up %s: %s", os.path.basename(path), exc)
 
     def identity(self):
         """(user id, device id) the next sign-in will use. Writes nothing.
@@ -544,18 +577,18 @@ class SetupService:
         server = self.server_address()
         data, state = self.users.load()
         creds, device_id = [], ""
-        if state == "ok" and server is not None:
+        if state == "ok":
             user = active_user(data)
             if user:
                 device_id = user.get("device_id") or ""
                 creds = [c for c in user.get("credentials") or []
                          if isinstance(c, dict) and c.get("AccessToken")]
 
-        # Signed in means: to the server that is chosen now. A credential
-        # for another server does not count. It matches by address, or by
-        # server id when the same server is reached by another address.
+        # Signed in means: to the server that is chosen now. It matches by
+        # address, or by server id when the same server is reached by
+        # another address.
         credential = info = None
-        if creds:
+        if creds and server is not None:
             info = self._cached_server_info(server, device_id)
             for cred in creds:
                 if (normalise_address(cred.get("address")) == server
@@ -563,10 +596,19 @@ class SetupService:
                     credential = cred
                     break
 
+        # A credential for another server is not signed in, but the shim
+        # still connects with it, so the card names it and offers Sign out.
+        other = None
+        if credential is None and creds:
+            other = creds[0]
+
         account = server_name = None
         if credential:
             account = credential.get("username")
             server_name = (info or {}).get("ServerName") or credential.get("Name")
+        elif other:
+            account = other.get("username")
+            server_name = other.get("Name") or other.get("address")
 
         return {
             "binary_installed": True,
@@ -583,6 +625,7 @@ class SetupService:
                 "server_name": server_name,
                 "ready": server is not None,
                 "reason": None if server is not None else NO_SERVER,
+                "other_server": other is not None,
             },
         }
 
@@ -688,9 +731,13 @@ class SetupService:
                 "uuid": str(uuid.uuid4()),
                 "username": user_info.get("Name"),
             }
-            user["credentials"] = [c for c in user["credentials"]
-                                   if not (isinstance(c, dict) and c.get("Id") == info.get("Id"))]
-            user["credentials"].append(credential)
+            # The only credential afterwards, in every profile: the shim
+            # connects with all it has, and one left for a previous server
+            # would keep the device a cast target there.
+            for other in data["users"]:
+                if isinstance(other, dict):
+                    other["credentials"] = []
+            user["credentials"] = [credential]
             self.users.save(data)
         except OSError as exc:
             log.error("could not write users.json: %s", exc)
@@ -708,6 +755,7 @@ class SetupService:
             self.pending = None
             self.info_cache.clear()
             if not self._has_credentials():
+                self.users.scrub_leftovers()
                 return {"logged_in": False}
             with self.player_stopped():
                 # Read again now that the shim has stopped and written its
@@ -725,6 +773,7 @@ class SetupService:
                     except OSError as exc:
                         log.error("could not write users.json: %s", exc)
                         raise HTTPFailure(500, "Could not remove the sign-in data") from None
+                self.users.scrub_leftovers()
             log.info("signed out")
         return {"logged_in": False}
 

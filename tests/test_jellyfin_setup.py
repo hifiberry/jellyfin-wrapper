@@ -328,7 +328,8 @@ def test_status_not_signed_in_ready(make_env):
     assert body["build_date"] is None and body["expires_on"] is None
     assert isinstance(body["version"], str) and body["version"]
     assert body["sign_in"] == {"method": "quick_connect", "account": None,
-                               "server_name": None, "ready": True, "reason": None}
+                               "server_name": None, "ready": True, "reason": None,
+                               "other_server": False}
 
 
 def test_status_no_server_not_ready(make_env):
@@ -369,19 +370,25 @@ def test_status_signed_in(make_env):
     assert body["sign_in"]["account"] == "alice"
     # Live from the server's /System/Info/Public, not the stored copy.
     assert body["sign_in"]["server_name"] == "Home"
+    assert body["sign_in"]["other_server"] is False
     assert "FAKE-TOKEN" not in json.dumps(body)
 
 
 def test_status_credential_for_other_server_is_not_signed_in(make_env):
     users = fixture_json("users.signed-in.json")  # server A at 192.0.2.10
     users["users"][0]["credentials"][0]["Id"] = "a" * 32
+    users["users"][0]["credentials"][0]["Name"] = "Cabin"
     env = make_env(users=users)
     env.configdb.values["player.jellyfin.server"] = env.jellyfin.url  # server B
     _, body = env.call("GET", "/status")
     assert body["logged_in"] is False
-    assert body["sign_in"]["account"] is None
-    assert body["sign_in"]["server_name"] is None
+    # The shim still connects to A with it, so the panel has to say so and
+    # offer to sign out.
+    assert body["sign_in"]["other_server"] is True
+    assert body["sign_in"]["account"] == "alice"
+    assert body["sign_in"]["server_name"] == "Cabin"
     assert body["sign_in"]["ready"] is True
+    assert "FAKE-TOKEN" not in json.dumps(body)
 
 
 def test_status_credential_matches_by_server_id(make_env):
@@ -401,6 +408,16 @@ def test_status_signed_in_but_no_server_chosen(make_env):
     _, body = env.call("GET", "/status")
     assert body["logged_in"] is False
     assert body["sign_in"]["ready"] is False
+    assert body["sign_in"]["other_server"] is True
+    assert body["sign_in"]["account"] == "alice"
+    assert body["sign_in"]["server_name"] == "Home"
+
+
+def test_status_not_signed_in_anywhere_is_not_other_server(make_env):
+    env = make_env(users=fixture_json("users.fresh.json"))
+    _, body = env.call("GET", "/status")
+    assert body["sign_in"]["other_server"] is False
+    assert body["sign_in"]["account"] is None
 
 
 def test_status_signed_in_server_offline_uses_stored_name(make_env):
@@ -609,20 +626,61 @@ def test_poll_approved_player_does_not_stop(make_env):
     assert env.snapshot("restart")["users"][0]["credentials"][0]["AccessToken"] == TOKEN
 
 
-def test_poll_approved_replaces_credential_for_same_server(make_env):
+def test_poll_approved_replaces_every_credential(make_env):
+    # One device, one signed-in user on one server: the shim connects with
+    # every credential it has, so one left behind for the previous server
+    # would keep the device a cast target there.
     users = fixture_json("users.signed-in.json")
     other = copy.deepcopy(users["users"][0]["credentials"][0])
     other.update(Id="ffffffffffffffffffffffffffffffff", address="http://192.0.2.20:8096",
                  AccessToken="OTHER")
     users["users"][0]["credentials"].append(other)
+    profile = copy.deepcopy(users["users"][0])
+    profile.update(id="00000000-0000-4000-8000-000000000002", default=False,
+                   device_id="00000000-0000-4000-8000-0000000000d2")
+    users["users"].append(profile)
     env = make_env(users=users)
     env.configdb.values["player.jellyfin.server"] = env.jellyfin.url
     env.call("POST", "/login")
     env.jellyfin.authenticated = True
     assert env.call("GET", "/login")[1]["state"] == "approved"
-    creds = env.users()["users"][0]["credentials"]
-    assert sorted(c["Id"] for c in creds) == sorted([SERVER_ID, other["Id"]])
-    assert [c["AccessToken"] for c in creds if c["Id"] == SERVER_ID] == [TOKEN]
+    saved = env.users()
+    creds = saved["users"][0]["credentials"]
+    assert [(c["Id"], c["AccessToken"]) for c in creds] == [(SERVER_ID, TOKEN)]
+    assert saved["users"][1]["credentials"] == []
+    raw = env.users_path.read_text()
+    assert "OTHER" not in raw and "FAKE-TOKEN-0000" not in raw
+
+
+def test_sign_in_rewrites_the_shim_backup(make_env):
+    # The shim restores users.json from users.json.bak when the file is
+    # damaged; a backup still holding the old server's token would bring it
+    # back.
+    old = fixture_json("users.signed-in.json")
+    env = make_env(users=fixture_json("users.fresh.json"))
+    backup = env.conf_dir / "users.json.bak"
+    backup.write_text(json.dumps(old))
+    env.configdb.values["player.jellyfin.server"] = env.jellyfin.url
+    env.call("POST", "/login")
+    env.jellyfin.authenticated = True
+    assert env.call("GET", "/login")[1]["state"] == "approved"
+    assert json.loads(backup.read_text()) == env.users()
+    assert stat.S_IMODE(backup.stat().st_mode) == 0o600
+
+
+def test_sign_in_on_other_server_then_status(make_env):
+    users = fixture_json("users.signed-in.json")  # server A at 192.0.2.10
+    users["users"][0]["credentials"][0]["Id"] = "a" * 32
+    env = make_env(users=users)
+    env.configdb.values["player.jellyfin.server"] = env.jellyfin.url  # server B
+    assert env.call("GET", "/status")[1]["sign_in"]["other_server"] is True
+    env.call("POST", "/login")
+    env.jellyfin.authenticated = True
+    assert env.call("GET", "/login")[1]["state"] == "approved"
+    _, body = env.call("GET", "/status")
+    assert body["logged_in"] is True
+    assert body["sign_in"]["other_server"] is False
+    assert [c["Id"] for c in env.users()["users"][0]["credentials"]] == [SERVER_ID]
 
 
 def test_poll_expires(make_env):
@@ -716,6 +774,51 @@ def test_logout_removes_credentials(make_env):
     assert env.snapshot("start")["users"][0]["credentials"] == []
     _, body = env.call("GET", "/status")
     assert body["logged_in"] is False
+
+
+def test_logout_removes_credentials_of_every_profile_and_server(make_env):
+    users = fixture_json("users.signed-in.json")
+    users["users"][0]["credentials"][0]["Id"] = "a" * 32  # another server
+    users["users"][0]["credentials"][0]["address"] = closed_port_url()
+    profile = copy.deepcopy(users["users"][0])
+    profile.update(id="00000000-0000-4000-8000-000000000002", default=False)
+    users["users"].append(profile)
+    env = make_env(users=users, active=False)
+    env.configdb.values["player.jellyfin.server"] = env.jellyfin.url
+    assert env.call("POST", "/logout")[0] == 200
+    assert [u["credentials"] for u in env.users()["users"]] == [[], []]
+    _, body = env.call("GET", "/status")
+    assert body["sign_in"]["other_server"] is False
+    assert body["sign_in"]["account"] is None
+
+
+def _token_files(conf_dir):
+    return sorted(p.name for p in conf_dir.iterdir()
+                  if p.is_file() and "FAKE-TOKEN" in p.read_text(errors="replace"))
+
+
+def test_logout_leaves_no_token_in_shim_backups(make_env):
+    users = fixture_json("users.signed-in.json")
+    env = make_env(users=users, active=False)
+    text = json.dumps(users)
+    for name in ("users.json.bak", "users.json.tmp", "users.json.unreadable-1700000000",
+                 "users.json.corrupt"):
+        (env.conf_dir / name).write_text(text)
+    (env.conf_dir / "conf.json").write_text('{"volume": 42}')
+    assert env.call("POST", "/logout")[0] == 200
+    assert _token_files(env.conf_dir) == []
+    # The backup is kept, matching users.json, as the shim expects it.
+    assert json.loads((env.conf_dir / "users.json.bak").read_text()) == env.users()
+    assert (env.conf_dir / "conf.json").read_text() == '{"volume": 42}'
+
+
+def test_logout_cleans_backups_even_when_users_json_has_no_token(make_env):
+    env = make_env(users=fixture_json("users.fresh.json"), active=True)
+    (env.conf_dir / "users.json.bak").write_text(json.dumps(fixture_json("users.signed-in.json")))
+    assert env.call("POST", "/logout")[0] == 200
+    assert _token_files(env.conf_dir) == []
+    # Nothing in users.json changed, so the player is left alone.
+    assert env.systemctl_calls() == []
 
 
 def test_logout_server_unreachable_still_removes(make_env):
