@@ -95,8 +95,11 @@ fi
 # only happens at the next login or boot, and until then the WebUI's
 # Jellyfin card has nothing to talk to. restart rather than start, so an
 # upgrade replaces a running old version. jellyfin.service (the player)
-# ships disabled and is left alone. Best effort: no user manager yet (fresh
-# image, user never logged in) is not an error.
+# ships disabled and a fresh install leaves it alone; on an upgrade ($2 is
+# the version replaced) a running player is restarted with the new shim and
+# start-jellyfin, and a stopped one stays stopped (try-restart). Best
+# effort: no user manager yet (fresh image, user never logged in) is not an
+# error.
 if [ -n "$HB_USER" ] && running; then
     HB_UID=$(id -u "$HB_USER" 2>/dev/null || true)
     if [ -n "$HB_UID" ] && [ -d "$ROOT/run/user/$HB_UID" ]; then
@@ -109,6 +112,11 @@ if [ -n "$HB_USER" ] && running; then
                 --pipe --wait --quiet --collect \
                 systemctl --user restart jellyfin-setup.service; then
             echo "hifiberry-jellyfin: could not start jellyfin-setup.service for $HB_USER; the WebUI's Jellyfin card will not work until the next login or reboot" >&2
+        fi
+        if [ -n "${2:-}" ] && ! systemd-run --uid "$HB_UID" --setenv XDG_RUNTIME_DIR="/run/user/$HB_UID" \
+                --pipe --wait --quiet --collect \
+                systemctl --user try-restart jellyfin.service; then
+            echo "hifiberry-jellyfin: could not restart jellyfin.service for $HB_USER; the player runs the old version until it is restarted" >&2
         fi
     fi
 fi

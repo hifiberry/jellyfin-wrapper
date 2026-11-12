@@ -130,8 +130,17 @@ the slider. Mute stays in mpv.
   managers started afterwards. Audio works without the reboot.
 - On a running system, `postinst` reloads nginx and starts
   `jellyfin-setup.service` in the player user's manager, so the WebUI card
-  works straight away. It does not restart config-server: during an install
+  works straight away. On an upgrade it also restarts a running player
+  (`try-restart jellyfin.service`), so it runs the new version; a stopped
+  player stays stopped. It does not restart config-server: during an install
   from the WebUI, config-server is the process running apt.
+- If the player's settings show no "Server address" field after an install
+  from a shell (`apt install`), config-server is still using the settings it
+  read before the package was there: reboot, or restart config-server.
+  (An install from the WebUI's extension page does not need this.)
+- On removal, `prerm` stops `jellyfin.service` and `jellyfin-setup.service`
+  in the player user's manager (best effort), so neither keeps running from
+  deleted files until the next reboot.
 
 ## `jellyfin-setup`: signing in
 
@@ -152,7 +161,12 @@ proxied:
 
 - **Which server**: ConfigDB's `player.jellyfin.server_url` (typed in by hand)
   when it is set, otherwise `player.jellyfin.server` (picked from the
-  drop-down), read on every request. A bare host gets `http://` and port 8096.
+  drop-down), read on every request. The address field takes only
+  `http://...` or `https://...`; a bare host reaching ConfigDB some other way
+  gets `http://` and port 8096. An HTTPS server whose certificate the
+  device does not trust (self-signed) is reported as "Server not reachable":
+  use its `http://` address on the local network, or give it a certificate
+  from a public CA.
 - **Discovery**: the Jellyfin probe `who is JellyfinServer?` broadcast to UDP
   port 7359, answers collected for 2 s, at start and every 60 s in the
   background. `/servers` answers from that list at once and never waits for

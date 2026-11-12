@@ -28,6 +28,9 @@ location = /api/jellyfin/status {
 
 location = /api/jellyfin/login {
     proxy_pass http://127.0.0.1:3551/login;
+    # The poll that completes a sign-in stops the player, writes users.json
+    # and starts the player again: up to ~70 s, past nginx's default 60 s.
+    proxy_read_timeout 120s;
 }
 
 location = /api/jellyfin/logout {

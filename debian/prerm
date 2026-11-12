@@ -1,0 +1,36 @@
+#!/bin/sh
+set -e
+
+# Every path below is prefixed with $DPKG_ROOT, which dpkg sets (empty on a
+# normal install). The tests run this script against a temporary root.
+ROOT="${DPKG_ROOT:-}"
+
+# On removal, stop the player and the setup service in the player user's
+# systemd --user manager: dpkg's own systemd handling covers system units
+# only, so without this the shim keeps running from a deleted venv and
+# jellyfin-setup keeps answering until the next reboot. Only on remove: on
+# upgrade the units keep running and postinst restarts them with the new
+# files. Best effort, like the start in postinst: no user manager (image
+# build, user never logged in) is not an error, and a failing stop must not
+# block the removal.
+if [ "$1" = "remove" ] && [ -d "$ROOT/run/systemd/system" ]; then
+    HB_USER=""
+    if [ -f "$ROOT/etc/hifiberry.user" ]; then
+        HB_USER=$(grep -vE '^[[:space:]]*#|^[[:space:]]*$' "$ROOT/etc/hifiberry.user" | head -1 | tr -d '[:space:]')
+    fi
+    HB_UID=""
+    if [ -n "$HB_USER" ]; then
+        HB_UID=$(id -u "$HB_USER" 2>/dev/null || true)
+    fi
+    if [ -n "$HB_UID" ] && [ -d "$ROOT/run/user/$HB_UID" ]; then
+        if ! systemd-run --uid "$HB_UID" --setenv XDG_RUNTIME_DIR="/run/user/$HB_UID" \
+                --pipe --wait --quiet --collect \
+                systemctl --user stop jellyfin.service jellyfin-setup.service; then
+            echo "hifiberry-jellyfin: could not stop the Jellyfin units of $HB_USER; they stop at the next reboot" >&2
+        fi
+    fi
+fi
+
+#DEBHELPER#
+
+exit 0

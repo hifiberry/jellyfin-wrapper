@@ -29,11 +29,13 @@ XB-Extension-Icon-Url: /images/svg/tv.svg
 # curl and alsa-utils: the hardware volume script (hifiberry-volume.lua)
 # asks config-server for the volume control and drives it with amixer.
 # hifiberry-configurator 2.19.0 is the first with the "text" setting type
-# the server address uses.
+# the server address uses; hifiberry-webui 0.28.0 the first that shows it,
+# and the first with the player card's Quick Connect sign-in.
 Depends: ${misc:Depends}, ${venv:Python},
  python3-gi, gir1.2-glib-2.0, python3-pil, libmpv2,
  curl, alsa-utils,
- hifiberry-configurator (>= 2.19.0), hifiberry-audiocontrol
+ hifiberry-configurator (>= 2.19.0), hifiberry-audiocontrol,
+ hifiberry-webui (>= 0.28.0)
 Description: Jellyfin cast target for HiFiBerryOS
  Makes the device a playback target for Jellyfin: cast music, movies and
  series to it from any Jellyfin app. Audio plays through the normal

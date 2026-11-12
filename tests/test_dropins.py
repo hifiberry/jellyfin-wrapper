@@ -6,7 +6,7 @@ auth manifest with hifiberry-auth's own resolver when those are importable
 (put their source trees on PYTHONPATH); otherwise with a copy of the rules
 they apply, so the suite also runs in the package build.
 
-debian/postinst and debian/postrm run for real under sh, against a
+debian/postinst, debian/prerm and debian/postrm run for real under sh, against a
 temporary root ($DPKG_ROOT) and with stand-ins for getent, id, usermod,
 systemctl and systemd-run that log what they were asked to do.
 """
@@ -30,6 +30,7 @@ NGINX = DATA / "etc/nginx/hifiberry-api.d/jellyfin.nginx"
 AUTH = DATA / "etc/hifiberry/auth.d/jellyfin-auth.json"
 POSTINST = REPO / "debian/postinst"
 POSTRM = REPO / "debian/postrm"
+PRERM = REPO / "debian/prerm"
 CONTROL = REPO / "debian/control"
 
 BUS_NAME = "org.mpris.MediaPlayer2.com.github.iwalton3.jellyfin-mpv-shim"
@@ -97,6 +98,9 @@ def test_descriptor_settings_exact():
 
     url = by_key["server_url"]
     assert url["type"] == "text"
+    # The pattern rejects a bare host; the description has to say why.
+    assert "http://" in url["description"] and "https://" in url["description"]
+    assert "start with" in url["description"]
     assert url["default"] == ""
     assert url["pattern"] == "^(https?://.+)?$"
     pattern = re.compile(url["pattern"])
@@ -198,6 +202,14 @@ def test_nginx_exact_match_only():
     for exact, _, _ in locations:
         assert exact.strip() == "=", "prefix location would publish every path"
     assert not re.search(r"location\s+/api/jellyfin", re.sub(r"#.*", "", NGINX.read_text()))
+
+
+def test_nginx_login_waits_for_sign_in_completion():
+    # The poll that completes a sign-in stops the player, writes users.json
+    # and starts it again (up to ~70 s); nginx's default 60 s would cut it.
+    bodies = {path: body for _, path, body in nginx_locations()}
+    timeout = re.search(r"proxy_read_timeout\s+(\d+)s;", bodies["/api/jellyfin/login"])
+    assert timeout and int(timeout.group(1)) >= 120
 
 
 def test_nginx_proxies_setup_paths():
@@ -302,7 +314,9 @@ def test_control_depends():
     deps = [d.strip() for d in control_fields()["Depends"].replace("\n", " ").split(",")]
     for want in ("${misc:Depends}", "${venv:Python}", "python3-gi", "gir1.2-glib-2.0",
                  "python3-pil", "libmpv2", "curl", "alsa-utils",
-                 "hifiberry-configurator (>= 2.19.0)", "hifiberry-audiocontrol"):
+                 "hifiberry-configurator (>= 2.19.0)", "hifiberry-audiocontrol",
+                 # The player card's text setting and sign-in panel.
+                 "hifiberry-webui (>= 0.28.0)"):
         assert want in deps, want
 
 
@@ -382,7 +396,7 @@ def system(tmp_path):
     return System(tmp_path)
 
 
-@pytest.mark.parametrize("script", [POSTINST, POSTRM])
+@pytest.mark.parametrize("script", [POSTINST, PRERM, POSTRM])
 def test_maintainer_script_syntax(script):
     subprocess.run(["sh", "-n", str(script)], check=True)
 
@@ -461,6 +475,82 @@ def test_postinst_starts_setup_service_in_user_manager(system):
     assert any("--uid 1000" in l and "jellyfin-setup.service" in l for l in runs)
     # The player itself ships disabled; installing the package does not start it.
     assert not any(re.search(r"\bjellyfin\.service", l) for l in runs)
+
+
+def user_manager_calls(system):
+    """The systemctl --user command lines run through systemd-run."""
+    return [l.split(" systemctl ", 1)[1] for l in system.log()
+            if l.startswith("systemd-run") and "--uid 1000" in l
+            and "XDG_RUNTIME_DIR=/run/user/1000" in l and " systemctl " in l]
+
+
+def test_postinst_upgrade_restarts_a_running_player(system):
+    # An upgrade replaces the shim and start-jellyfin under a running player;
+    # try-restart picks the new ones up and leaves a stopped player stopped.
+    system.user_file("music\n")
+    system.running()
+    r = system.run(POSTINST, "configure", "0.1.0")
+    assert r.returncode == 0, r.stderr
+    assert "--user try-restart jellyfin.service" in user_manager_calls(system)
+
+
+def test_postinst_fresh_install_does_not_touch_the_player(system):
+    system.user_file("music\n")
+    system.running()
+    r = system.run(POSTINST, "configure", "")
+    assert r.returncode == 0, r.stderr
+    assert not any(re.search(r"\bjellyfin\.service", c) for c in user_manager_calls(system))
+
+
+def test_prerm_remove_stops_both_user_units(system):
+    system.user_file("music\n")
+    system.running()
+    r = system.run(PRERM, "remove")
+    assert r.returncode == 0, r.stderr
+    calls = user_manager_calls(system)
+    assert any(c.startswith("--user stop") and "jellyfin.service" in c
+               and "jellyfin-setup.service" in c for c in calls), calls
+
+
+def test_prerm_upgrade_leaves_the_player_running(system):
+    # postinst's try-restart restarts a running player with the new files;
+    # stopped here, it would stay off after every upgrade.
+    system.user_file("music\n")
+    system.running()
+    r = system.run(PRERM, "upgrade", "0.2.0")
+    assert r.returncode == 0, r.stderr
+    assert user_manager_calls(system) == []
+
+
+def test_prerm_without_user_manager_is_not_an_error(system):
+    system.user_file("music\n")
+    system.running(user_manager=False)
+    r = system.run(PRERM, "remove")
+    assert r.returncode == 0, r.stderr
+    assert not any(l.startswith("systemd-run") for l in system.log())
+
+
+def test_prerm_without_player_user_is_not_an_error(system):
+    system.running()
+    r = system.run(PRERM, "remove")
+    assert r.returncode == 0, r.stderr
+    assert not any(l.startswith("systemd-run") for l in system.log())
+
+
+def test_prerm_failing_stop_does_not_block_removal(system):
+    system.user_file("music\n")
+    system.running()
+    (system.bin / "systemd-run").write_text(
+        '#!/bin/sh\necho "systemd-run $*" >> "$FAKE/log"\nexit 1\n')
+    r = system.run(PRERM, "remove")
+    assert r.returncode == 0, r.stderr
+
+
+def test_prerm_not_running_system_does_nothing(system):
+    system.user_file("music\n")
+    r = system.run(PRERM, "remove")
+    assert r.returncode == 0, r.stderr
+    assert system.log() == []
 
 
 def test_postinst_no_user_manager_is_not_an_error(system):
