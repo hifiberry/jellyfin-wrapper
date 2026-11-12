@@ -1,0 +1,39 @@
+{
+    "name": "Jellyfin",
+    "provided_by": "hifiberry-jellyfin",
+    "systemd_service": "jellyfin",
+    "icon": "jellyfin",
+    "allow_change": true,
+    "setup": {
+        "base_url": "/api/jellyfin"
+    },
+    "maintainer_name": "Wanted",
+    "maintainer_url": "https://github.com/hifiberry/hifiberry-os/blob/hbosng/docs/maintainers-wanted.md",
+    "settings": [
+        {
+            "key": "server",
+            "type": "select",
+            "label": "Server",
+            "description": "Jellyfin servers found on this network.",
+            "default": "",
+            "options_url": "http://127.0.0.1:3551/servers",
+            "options_value": "address",
+            "options_label": "name"
+        },
+        {
+            "key": "server_url",
+            "type": "text",
+            "label": "Server address",
+            "description": "Only if your server is not listed, e.g. http://192.168.1.20:8096",
+            "default": "",
+            "pattern": "^(https?://.+)?$"
+        },
+        {
+            "key": "unlimited_remote",
+            "type": "toggle",
+            "label": "Full quality over VPN",
+            "description": "Plays at full quality from a server reached over a VPN or the internet instead of transcoding it down to 10 Mbit/s. Leave off for a server across a slow connection.",
+            "default": false
+        }
+    ]
+}

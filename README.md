@@ -18,6 +18,11 @@ HDMI when a display is connected.
 | `/usr/lib/systemd/user/jellyfin.service` | The player. Ships disabled; toggled from Services > Players. |
 | `/usr/bin/jellyfin-setup` | Sign-in and server discovery for the WebUI, on 127.0.0.1:3551. |
 | `/usr/lib/systemd/user/jellyfin-setup.service` | Runs `jellyfin-setup`. Ships enabled. |
+| `/usr/share/hifiberry/players.d/jellyfin.json` + `icons/jellyfin.svg` | The player as the WebUI shows it: server drop-down, server address, "Full quality over VPN", sign-in panel (`setup.base_url`). |
+| `/etc/audiocontrol/players.d/jellyfin.json` | audiocontrol follows the shim over MPRIS on the system bus. |
+| `/etc/configserver/conf.d/jellyfin.json` | Lets the WebUI start and stop both units. |
+| `/etc/nginx/hifiberry-api.d/jellyfin.nginx` | `/api/jellyfin/{status,login,logout}` to `jellyfin-setup`, exact matches only. |
+| `/etc/hifiberry/auth.d/jellyfin-auth.json` | `GET /status` and `GET /login` without a password; signing in and out need one. |
 
 ## The shim is vendored
 
@@ -87,11 +92,31 @@ All of it lives in `~/.config/jellyfin-mpv-shim/` of the player user.
 `WAYLAND_DISPLAY`, the conf.json keys it would set and the resulting
 `mpv.conf` as JSON, and changes nothing.
 
+## What the package sets up on install
+
+- **MPRIS on the system bus.** audiocontrol runs as its own user and cannot
+  reach the player user's session bus, so `jellyfin.service` points the
+  shim's session bus at the system bus. `postinst` generates
+  `/usr/share/dbus-1/system.d/hifiberry-jellyfin.conf` from
+  `/etc/hifiberry.user`: the player user may own
+  `org.mpris.MediaPlayer2.com.github.iwalton3.jellyfin-mpv-shim`, anyone may
+  send to it. It is regenerated on every install and removed on purge.
+- **`render` group.** Video needs `/dev/dri/renderD*`. `postinst` adds the
+  player user to `render` if it is not a member yet, and only then flags a
+  reboot (`/run/reboot-required`), since group membership reaches only user
+  managers started afterwards. Audio works without the reboot.
+- On a running system, `postinst` reloads nginx and starts
+  `jellyfin-setup.service` in the player user's manager, so the WebUI card
+  works straight away. It does not restart config-server: during an install
+  from the WebUI, config-server is the process running apt.
+
 ## `jellyfin-setup`: signing in
 
 The player card in the WebUI signs the device in to a Jellyfin server with
 Quick Connect, so nobody has to type a password on the device. nginx forwards
-`/api/jellyfin/*` to `jellyfin-setup`, which listens on 127.0.0.1:3551 only:
+`/api/jellyfin/status`, `/login` and `/logout` to `jellyfin-setup`, which
+listens on 127.0.0.1:3551 only; `/servers` is for config-server and is not
+proxied:
 
 | Request | Answer |
 | --- | --- |

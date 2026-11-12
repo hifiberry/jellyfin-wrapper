@@ -14,5 +14,11 @@ hifiberry-jellyfin (0.1.0) trixie; urgency=medium
     - jellyfin-setup, enabled by default: signs the device in with Quick
       Connect for the WebUI, finds Jellyfin servers on the LAN for the
       server setting, and signs out again
+    - Player descriptor with the server drop-down, a server address field
+      and "Full quality over VPN"; audiocontrol, config-server, nginx and
+      auth drop-ins for the player and its sign-in API
+    - MPRIS on the system bus for audiocontrol, with a D-Bus policy for the
+      player user generated on install; the player user joins the render
+      group, with a reboot requested only when it had to be added
 
  -- HiFiBerry <support@hifiberry.com>  Thu, 12 Nov 2026 12:00:00 +0000

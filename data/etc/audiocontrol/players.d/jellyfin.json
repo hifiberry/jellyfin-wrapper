@@ -1,0 +1,10 @@
+{
+    "mpris": {
+        "bus_name": "org.mpris.MediaPlayer2.com.github.iwalton3.jellyfin-mpv-shim",
+        "name": "jellyfin",
+        "bus": "system",
+        "poll_interval": 1.0,
+        "clear_song_when_stopped": true,
+        "artwork_dirs": ["/tmp/jellyfin-mpv-shim/.cache/jellyfin-mpv-shim/mpris"]
+    }
+}

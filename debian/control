@@ -8,8 +8,32 @@ Homepage: https://github.com/hifiberry/jellyfin-wrapper
 
 Package: hifiberry-jellyfin
 Architecture: all
+# Extension metadata. These XB- fields are the ONLY thing the WebUI's
+# extension catalog reads (configurator's extensions/catalog.py builds every
+# card from the apt record) -- omit one and it silently falls back: no
+# Extension-Name shows the raw package name, no Extension-Category files a
+# player under "Tools". dpkg strips the XB- prefix in the built record.
+XB-Hifiberry-Extension: yes
+XB-Extension-Name: Jellyfin
+XB-Extension-Category: player
+# postinst adds the player user to the render group (video decoding and
+# display) when it is not a member yet, and only then asks for a reboot.
+XB-Extension-Needs-Reboot: maybe
+# Served by hifiberry-webui itself, so this resolves on a device with no
+# internet access; an external URL would leave a broken image offline. The
+# WebUI has no Jellyfin icon, so its generic screen icon stands in. The
+# package's own icon (players.d/icons/jellyfin.svg) is served by
+# config-server only once the package is installed, too late for the
+# catalog.
+XB-Extension-Icon-Url: /images/svg/tv.svg
+# curl and alsa-utils: the hardware volume script (hifiberry-volume.lua)
+# asks config-server for the volume control and drives it with amixer.
+# hifiberry-configurator 2.19.0 is the first with the "text" setting type
+# the server address uses.
 Depends: ${misc:Depends}, ${venv:Python},
- python3-gi, gir1.2-glib-2.0, python3-pil, libmpv2
+ python3-gi, gir1.2-glib-2.0, python3-pil, libmpv2,
+ curl, alsa-utils,
+ hifiberry-configurator (>= 2.19.0), hifiberry-audiocontrol
 Description: Jellyfin cast target for HiFiBerryOS
  Makes the device a playback target for Jellyfin: cast music, movies and
  series to it from any Jellyfin app. Audio plays through the normal

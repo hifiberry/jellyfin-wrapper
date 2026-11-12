@@ -1,0 +1,33 @@
+# Setup API for the Jellyfin extension. jellyfin-setup listens on
+# 127.0.0.1:3551 and is itself unauthenticated -- any local process can
+# already reach it -- so nginx is what stands between the browser and it.
+#
+# Only the three paths the WebUI's player card uses are proxied, and each is
+# an EXACT-MATCH `location =`, not a prefix: a prefix location
+# (`location /api/jellyfin/`) would publish every path jellyfin-setup serves,
+# now and in future versions, as a side effect.
+#
+# /servers is deliberately NOT proxied. Its only client is config-server,
+# which fetches it on loopback to fill the server drop-down (the descriptor's
+# options_url); the browser never asks for it. A request for
+# /api/jellyfin/servers falls through to the WebUI's SPA catch-all and has
+# nothing behind it.
+#
+# Tiering (see /etc/hifiberry/auth.d/jellyfin-auth.json):
+#   - GET /status and GET /login are ok-tier: they report whether the device
+#     is signed in, to which server and account, and the state of a pending
+#     Quick Connect code. Never a token or the Quick Connect secret.
+#   - POST /login (start a sign-in), DELETE /login (cancel it) and
+#     POST /logout (revoke the token) change the device and are risky-tier.
+
+location = /api/jellyfin/status {
+    proxy_pass http://127.0.0.1:3551/status;
+}
+
+location = /api/jellyfin/login {
+    proxy_pass http://127.0.0.1:3551/login;
+}
+
+location = /api/jellyfin/logout {
+    proxy_pass http://127.0.0.1:3551/logout;
+}
