@@ -20,5 +20,8 @@ hifiberry-jellyfin (0.1.0) trixie; urgency=medium
     - MPRIS on the system bus for audiocontrol, with a D-Bus policy for the
       player user generated on install; the player user joins the render
       group, with a reboot requested only when it had to be added
+    - Hardware volume: the Jellyfin volume slider drives the sound card's
+      volume control reported by config-server, and follows changes made
+      elsewhere; boards without one keep mpv's software volume
 
  -- HiFiBerry <support@hifiberry.com>  Thu, 12 Nov 2026 12:00:00 +0000

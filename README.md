@@ -15,6 +15,7 @@ HDMI when a display is connected.
 | `/usr/lib/hifiberry-jellyfin/venv/` | jellyfin-mpv-shim and its Python dependencies (`requirements.txt`). |
 | `/usr/bin/start-jellyfin` | Prepares the shim's configuration, then execs it with `--no-gui`. |
 | `/usr/share/hifiberry-jellyfin/mpv.conf.{drm,wayland,audio}` | mpv templates. |
+| `/usr/share/hifiberry-jellyfin/scripts/hifiberry-volume.lua` | Hardware volume (mpv script). |
 | `/usr/lib/systemd/user/jellyfin.service` | The player. Ships disabled; toggled from Services > Players. |
 | `/usr/bin/jellyfin-setup` | Sign-in and server discovery for the WebUI, on 127.0.0.1:3551. |
 | `/usr/lib/systemd/user/jellyfin-setup.service` | Runs `jellyfin-setup`. Ships enabled. |
@@ -91,6 +92,18 @@ All of it lives in `~/.config/jellyfin-mpv-shim/` of the player user.
 `start-jellyfin --dry-run` prints the template, hwdec, display card,
 `WAYLAND_DISPLAY`, the conf.json keys it would set and the resulting
 `mpv.conf` as JSON, and changes nothing.
+
+## Hardware volume
+
+`hifiberry-volume.lua`, loaded by mpv from the shim's `scripts/` directory,
+asks config-server (`/api/v1/soundcard/detect`) for the card and its volume
+control when the player starts. Without a hardware control it does nothing
+and mpv keeps its software volume. With one, the volume slider in the
+Jellyfin app drives that control (`amixer -M`, the alsamixer scale), mpv's
+own attenuation is cancelled with `volume-gain` so the signal leaves mpv at
+unity, mpv adopts the control's level when playback starts, and while
+playing it reads the control every 2 s so a change made elsewhere shows on
+the slider. Mute stays in mpv.
 
 ## What the package sets up on install
 

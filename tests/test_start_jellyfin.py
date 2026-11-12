@@ -536,6 +536,25 @@ def test_volume_script_symlinked(tree):
     assert os.readlink(link) == str(tree.volume_target)
 
 
+def test_volume_script_link_target_is_packaged_script(tree):
+    # Without JELLYFIN_VOLUME_SCRIPT the link goes to scripts/ under the
+    # share directory: on a device /usr/share/hifiberry-jellyfin, here the
+    # same layout in the repo's data/ tree. It must point at a real script.
+    env = tree.env()
+    del env["JELLYFIN_VOLUME_SCRIPT"]
+    result = subprocess.run([sys.executable, str(SCRIPT)], env=env,
+                            capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stderr
+    link = tree.conf_dir / "scripts" / "hifiberry-volume.lua"
+    assert os.readlink(link) == str(SHARE / "scripts" / "hifiberry-volume.lua")
+    assert SHARE == REPO / "data" / "usr" / "share" / "hifiberry-jellyfin"
+    target = link.resolve()
+    assert target.is_file()
+    script = target.read_text()
+    assert "/api/v1/soundcard/detect" in script
+    assert "volume-gain" in script
+
+
 def test_volume_script_symlink_replaces_stale_entry(tree):
     scripts = tree.conf_dir / "scripts"
     scripts.mkdir(parents=True)
