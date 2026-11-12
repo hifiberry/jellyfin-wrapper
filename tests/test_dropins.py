@@ -139,6 +139,48 @@ def test_acr_artwork_dir_matches_unit_cache():
     assert load(ACR)["mpris"]["artwork_dirs"] == [cache + "/jellyfin-mpv-shim/mpris"]
 
 
+UNITS = DATA / "usr/lib/systemd/user"
+
+
+def unit_settings(name):
+    """{(section, key): [values]} of a unit file."""
+    settings, section = {}, None
+    for line in (UNITS / name).read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith(("#", ";")):
+            continue
+        if line.startswith("["):
+            section = line.strip("[]")
+            continue
+        key, _, value = line.partition("=")
+        settings.setdefault((section, key.strip()), []).append(value.strip())
+    return settings
+
+
+@pytest.mark.parametrize("unit", ["jellyfin.service", "jellyfin-setup.service"])
+def test_user_units_order_only_on_user_units(unit):
+    # A --user manager cannot see system units: After=/Wants= on
+    # network-online.target or sound.target do nothing there and only
+    # suggest an ordering that does not exist.
+    text = (UNITS / unit).read_text()
+    code = "\n".join(l for l in text.splitlines() if not l.lstrip().startswith("#"))
+    for system_target in ("network-online.target", "network.target", "sound.target"):
+        assert system_target not in code, (unit, system_target)
+
+
+def test_player_unit_start_limit_is_reachable():
+    # Restart=on-failure must end in a failed unit for a player that keeps
+    # crashing, not restart it for ever: the burst has to fit in the
+    # interval even with a few seconds of start-up per attempt.
+    u = unit_settings("jellyfin.service")
+    assert u[("Service", "Restart")] == ["on-failure"]
+    restart_sec = float(u[("Service", "RestartSec")][0])
+    interval = float(u[("Unit", "StartLimitIntervalSec")][0])
+    burst = int(u[("Unit", "StartLimitBurst")][0])
+    startup = 5  # generous: Python start plus the shim's imports on a Pi
+    assert burst * (restart_sec + startup) < interval
+
+
 def test_configserver_may_toggle_both_units():
     assert load(CONFSERVER) == {"systemd": {"jellyfin": "all", "jellyfin-setup": "all"}}
 

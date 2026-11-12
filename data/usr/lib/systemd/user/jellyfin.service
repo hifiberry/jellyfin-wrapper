@@ -1,7 +1,18 @@
 [Unit]
 Description=Jellyfin cast target (jellyfin-mpv-shim)
-After=sound.target network-online.target pipewire.service
-Wants=network-online.target jellyfin-setup.service
+# Only user units can be ordered against here: this runs in the player
+# user's systemd --user manager, which does not see network-online.target or
+# sound.target. Not waiting for the network is fine: start-jellyfin sets
+# connect_retry_mins, so the shim keeps retrying a server it cannot reach yet.
+After=pipewire.service
+Wants=jellyfin-setup.service
+# Five failed starts within two minutes leave the unit failed. Each attempt
+# takes RestartSec plus the shim's start-up (several seconds on a Pi), so the
+# default limit of five in 10 s would never be reached and a crashing player
+# would be restarted for ever. Not signed in is not a failure: start-jellyfin
+# then exits 0 without starting the shim and the unit is simply inactive.
+StartLimitIntervalSec=120
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -15,8 +26,6 @@ Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/dbus/system_bus_socket
 Environment=XDG_CACHE_HOME=/tmp/jellyfin-mpv-shim/.cache
 ExecStart=/usr/bin/start-jellyfin
 Restart=on-failure
-# Well under StartLimitIntervalSec (10s), so five failed starts in a row do
-# trip the default start limit instead of retrying for ever.
 RestartSec=2
 
 [Install]

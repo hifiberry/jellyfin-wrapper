@@ -23,6 +23,7 @@ import pytest
 REPO = pathlib.Path(__file__).resolve().parent.parent
 SCRIPT = REPO / "scripts" / "start-jellyfin"
 SHARE = REPO / "data" / "usr" / "share" / "hifiberry-jellyfin"
+FIXTURES = pathlib.Path(__file__).resolve().parent / "fixtures"
 
 PI4 = "Raspberry Pi 4 Model B Rev 1.4"
 PI5 = "Raspberry Pi 5 Model B Rev 1.0"
@@ -116,6 +117,16 @@ class Tree:
         self.set_model(PI4)
         self.fake_command("hostnamectl", 'echo "Living Room"')
         self.fake_command("hostname", 'echo "hifiberry"')
+        # Signed in unless a test says otherwise: without a credential the
+        # shim is not started at all.
+        self.write_users(json.loads((FIXTURES / "users.signed-in.json").read_text()))
+
+    def write_users(self, data, name="users.json"):
+        self.conf_dir.mkdir(parents=True, exist_ok=True)
+        path = self.conf_dir / name
+        path.write_text(data if isinstance(data, str) else json.dumps(data, indent=4))
+        path.chmod(0o600)
+        return path
 
     def cleanup(self):
         for s in self.listeners:
@@ -306,7 +317,7 @@ def test_all_templates_use_pipewire_and_fast_profile(tree):
 
 def test_mpv_conf_replaced_on_every_start(tree):
     tree.add_card(1, "vc4-drm", [("HDMI-A-1", "connected")])
-    tree.conf_dir.mkdir(parents=True)
+    tree.conf_dir.mkdir(parents=True, exist_ok=True)
     (tree.conf_dir / "mpv.conf").write_text("vo=x11\nmy-own-option=1\n")
 
     tree.start()
@@ -364,6 +375,7 @@ OWNED = {
     "headless": True,
     "close_to_tray": False,
     "media_keys": False,
+    "connect_retry_mins": 1440,
     "player_name": "Living Room",
 }
 
@@ -480,7 +492,7 @@ def test_dry_run_reports_conf_keys(tree):
 
 
 def test_corrupt_conf_json_is_set_aside(tree):
-    tree.conf_dir.mkdir(parents=True)
+    tree.conf_dir.mkdir(parents=True, exist_ok=True)
     (tree.conf_dir / "conf.json").write_text("{not json")
     tree.start()
     assert tree.conf_json() == OWNED
@@ -568,19 +580,116 @@ def test_volume_script_symlink_replaces_stale_entry(tree):
 
 
 def test_users_json_untouched(tree):
-    tree.conf_dir.mkdir(parents=True)
     users = tree.conf_dir / "users.json"
-    content = b'[{"credentials": [{"address": "http://192.0.2.10:8096"}]}]'
-    users.write_bytes(content)
+    content = users.read_bytes()
     os.utime(users, (1_000_000_000, 1_000_000_000))
     tree.start()
     assert users.read_bytes() == content
     assert users.stat().st_mtime == 1_000_000_000
+    assert tree.shim_argv() == ["--no-gui"]
 
 
-def test_users_json_not_created(tree):
-    tree.start()
+# --- not signed in: no shim -------------------------------------------------
+#
+# Without a credential that connects, jellyfin-mpv-shim falls back to asking
+# for a server URL on stdin. Under systemd stdin is /dev/null, so it dies of
+# EOFError and Restart=on-failure starts it again, for ever. start-jellyfin
+# therefore does not start it at all without a credential.
+
+def fresh_users():
+    return json.loads((FIXTURES / "users.fresh.json").read_text())
+
+
+def assert_not_started(tree, result):
+    assert result.returncode == 0, result.stderr
+    assert not tree.shim_out.exists()
+    lines = [l for l in result.stderr.splitlines() if l.strip()]
+    assert len(lines) == 1, result.stderr
+    assert "not signed in" in lines[0]
+    # Nothing is prepared for a player that does not run.
+    assert not (tree.conf_dir / "conf.json").exists()
+    assert not (tree.conf_dir / "mpv.conf").exists()
+    assert not tree.cache_root.exists()
+
+
+def test_no_credential_does_not_start_shim(tree):
+    users = tree.write_users(fresh_users())
+    before = users.read_bytes()
+    os.utime(users, (1_000_000_000, 1_000_000_000))
+    assert_not_started(tree, tree.run())
+    assert users.read_bytes() == before
+    assert users.stat().st_mtime == 1_000_000_000
+
+
+def test_no_users_json_does_not_start_shim(tree):
+    (tree.conf_dir / "users.json").unlink()
+    assert_not_started(tree, tree.run())
     assert not (tree.conf_dir / "users.json").exists()
+
+
+def test_corrupt_users_json_does_not_start_shim(tree):
+    tree.write_users("{not json")
+    assert_not_started(tree, tree.run())
+    assert (tree.conf_dir / "users.json").read_text() == "{not json"
+
+
+def test_credential_without_token_does_not_start_shim(tree):
+    users = json.loads((FIXTURES / "users.signed-in.json").read_text())
+    del users["users"][0]["credentials"][0]["AccessToken"]
+    tree.write_users(users)
+    assert_not_started(tree, tree.run())
+
+
+def test_credential_of_another_profile_only_does_not_start_shim(tree):
+    # The shim connects with the active profile's credentials only.
+    users = json.loads((FIXTURES / "users.signed-in.json").read_text())
+    other = dict(fresh_users()["users"][0], id="00000000-0000-4000-8000-000000000002",
+                 default=False)
+    users["users"].append(other)
+    users["active"] = other["id"]
+    tree.write_users(users)
+    assert_not_started(tree, tree.run())
+
+
+def test_dangling_active_pointer_uses_first_profile(tree):
+    users = json.loads((FIXTURES / "users.signed-in.json").read_text())
+    users["active"] = "00000000-0000-4000-8000-0000000000ff"
+    tree.write_users(users)
+    tree.start()
+    assert tree.shim_argv() == ["--no-gui"]
+
+
+def test_credential_only_in_shim_backup_starts_shim(tree):
+    # The shim restores users.json from its .bak when the file is gone or
+    # damaged, so that credential is one it will connect with.
+    signed_in = (tree.conf_dir / "users.json").read_text()
+    (tree.conf_dir / "users.json").unlink()
+    tree.write_users(signed_in, name="users.json.bak")
+    tree.start()
+    assert tree.shim_argv() == ["--no-gui"]
+
+
+def test_backup_ignored_when_users_json_is_usable(tree):
+    signed_in = (tree.conf_dir / "users.json").read_text()
+    tree.write_users(fresh_users())
+    tree.write_users(signed_in, name="users.json.bak")
+    assert_not_started(tree, tree.run())
+
+
+def test_dry_run_reports_sign_in(tree):
+    assert tree.plan()["signed_in"] is True
+    tree.write_users(fresh_users())
+    assert tree.plan()["signed_in"] is False
+
+
+def test_conf_json_retries_unreachable_server(tree):
+    # connect_retry_mins 0 (the shim's default) makes a server that is not
+    # reachable yet -- the usual case at boot -- fall through to the stdin
+    # prompt; with it set the shim keeps retrying instead.
+    write_conf(tree, {"connect_retry_mins": 0})
+    tree.start()
+    assert tree.conf_json()["connect_retry_mins"] == 1440
+    assert tree.plan()["conf"]["connect_retry_mins"] == 1440
 
 
 # --- exec -------------------------------------------------------------------
@@ -604,6 +713,6 @@ def test_unit_environment_reaches_shim(tree):
 def test_dry_run_writes_nothing(tree):
     tree.add_card(1, "vc4-drm", [("HDMI-A-1", "connected")])
     tree.plan()
-    assert not tree.conf_dir.exists()
+    assert sorted(p.name for p in tree.conf_dir.iterdir()) == ["users.json"]
     assert not tree.cache_root.exists()
     assert not tree.shim_out.exists()

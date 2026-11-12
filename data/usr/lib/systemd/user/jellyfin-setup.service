@@ -1,7 +1,9 @@
 [Unit]
 Description=Jellyfin sign-in and server discovery for the WebUI
-After=network-online.target
-Wants=network-online.target
+# No network ordering: a --user manager does not see network-online.target.
+# None is needed either -- it listens on loopback, and discovery repeats
+# every 60 s, so a scan made before the network is up is soon followed by one
+# that finds the servers.
 
 [Service]
 Type=simple

@@ -14,7 +14,13 @@ leaves the rest to the shim:
   other key is the shim's. It is edited here, before exec, because the shim
   writes settings such as the last volume back to it while running.
 - scripts/hifiberry-volume.lua: a symlink to the packaged volume script.
-- users.json is jellyfin-setup's: never read, created or written here.
+- users.json is jellyfin-setup's: read here, never created or written.
+
+Without a stored credential it does none of that and does not start the
+shim either: it logs one line and exits 0, so the unit simply ends up
+inactive. jellyfin-mpv-shim with nothing to connect with asks for a server
+URL on stdin; under systemd that is /dev/null, so it would die of EOFError
+and be restarted, over and over.
 
 It also creates the artwork cache base under /tmp world-readable before the
 shim can create it 0700, so audiocontrol (another user) can read the covers.
@@ -81,7 +87,18 @@ OWNED_KEYS = {
     "headless": True,
     "close_to_tray": False,
     "media_keys": False,
+    # When no stored credential connects, the shim falls back to asking for
+    # a server URL on stdin -- unless this is set, in which case it retries
+    # every 30 s for this many minutes first. A server that is not reachable
+    # yet (boot; the user unit cannot wait for the network) or briefly down
+    # must not be the end of the player.
+    "connect_retry_mins": 1440,
 }
+
+USERS_FILE = "users.json"
+# The copy the shim writes after every save and restores from when
+# users.json is missing or damaged.
+USERS_BACKUP_SUFFIX = ".bak"
 
 
 def log(message):
@@ -285,6 +302,40 @@ def conf_updates(conf, name, unlimited):
     return updates
 
 
+# --- sign-in ----------------------------------------------------------------
+
+def _read_users(path):
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _active_credentials(data):
+    """The active profile's credentials, chosen the way the shim chooses."""
+    users = [u for u in data.get("users") or [] if isinstance(u, dict)]
+    if not users:
+        return []
+    active = next((u for u in users if u.get("id") == data.get("active")), users[0])
+    return [c for c in active.get("credentials") or []
+            if isinstance(c, dict) and c.get("AccessToken")]
+
+
+def signed_in():
+    """Whether the shim will find a credential to connect with. Read-only.
+
+    Mirrors the shim's own loading: users.json when it has any profile in
+    it, otherwise the backup it would restore from.
+    """
+    path = os.path.join(CONF_DIR, USERS_FILE)
+    data = _read_users(path)
+    if not (data and data.get("users")):
+        data = _read_users(path + USERS_BACKUP_SUFFIX)
+    return bool(data and _active_credentials(data))
+
+
 # --- files ------------------------------------------------------------------
 
 def write_atomic(path, text, mode=0o644):
@@ -337,6 +388,12 @@ def ensure_symlink(link, target):
 def main(argv):
     dry_run = "--dry-run" in argv[1:]
 
+    have_credential = signed_in()
+    if not have_credential and not dry_run:
+        log("not signed in to a Jellyfin server; the player stays off "
+            "(sign in from the player's settings)")
+        return 0
+
     template, hwdec, drm_device, wayland = choose_output()
     mpv_conf = mpv_conf_text(template, hwdec, drm_device)
 
@@ -351,6 +408,7 @@ def main(argv):
 
     if dry_run:
         print(json.dumps({
+            "signed_in": have_credential,
             "template": template,
             "hwdec": hwdec,
             "drm_device": drm_device,

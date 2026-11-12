@@ -45,6 +45,14 @@ versions and hashes in `requirements.txt`, keeping to `py3-none-any` wheels.
 
 All of it lives in `~/.config/jellyfin-mpv-shim/` of the player user.
 
+- **Not signed in: nothing.** Without a stored credential (in the active
+  profile of `users.json`, or in the `users.json.bak` the shim would restore
+  from) `start-jellyfin` logs one line, does not start the shim and exits 0;
+  the unit is then simply inactive. The shim with nothing to connect with
+  asks for a server URL on stdin, which under systemd is `/dev/null`: it
+  would die and be restarted over and over. Sign in from the player's
+  settings, then turn the player on.
+
 - **`mpv.conf`** is ours and is replaced on each start, from one of three
   templates:
   - `wayland` when kiosk mode's compositor answers on a socket in
@@ -63,7 +71,9 @@ All of it lives in `~/.config/jellyfin-mpv-shim/` of the player user.
   The display is checked when the player starts, not while it runs: plugging
   in a screen or starting kiosk mode takes effect at the next player restart.
 - **`conf.json`**: `enable_gui=false`, `headless=true`, `close_to_tray=false`,
-  `media_keys=false`, and `player_name` = the device name
+  `media_keys=false`, `connect_retry_mins=1440` (a server that cannot be
+  reached -- not up yet at boot, or briefly down -- is retried every 30 s for
+  a day instead of ending in the stdin prompt), and `player_name` = the device name
   (`hostnamectl hostname --pretty`, else `hostname`, else `HiFiBerry`). Every
   other key is the shim's own and is kept. The shim writes settings back to
   this file while it runs, so it is only edited before the exec. A file that
@@ -81,7 +91,7 @@ All of it lives in `~/.config/jellyfin-mpv-shim/` of the player user.
 - **`scripts/hifiberry-volume.lua`** is a symlink to
   `/usr/share/hifiberry-jellyfin/scripts/hifiberry-volume.lua`.
 - **`users.json`** holds the server token and belongs to the setup service;
-  `start-jellyfin` never reads, creates or writes it.
+  `start-jellyfin` only reads it (see above), never creates or writes it.
 - **Artwork**: `jellyfin.service` sets
   `XDG_CACHE_HOME=/tmp/jellyfin-mpv-shim/.cache`, and `start-jellyfin` creates
   `/tmp/jellyfin-mpv-shim` and its `.cache` with mode 0755 first. audiocontrol
