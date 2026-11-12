@@ -1,0 +1,369 @@
+#!/usr/bin/python3
+"""Prepare jellyfin-mpv-shim's configuration, then exec the shim.
+
+Run by jellyfin.service as the HiFiBerryOS player user. On every start it
+(re)writes the parts of ~/.config/jellyfin-mpv-shim/ this package owns and
+leaves the rest to the shim:
+
+- mpv.conf: replaced from the template that fits the hardware right now --
+  wayland (kiosk mode's compositor is running), drm (an HDMI display is
+  connected) or audio (neither, or a Pi model without usable hardware video
+  decoding) -- plus the display card and the model's hwdec.
+- conf.json: the keys that keep the shim headless and name it after the
+  device; remote_kbps follows the "Full quality over VPN" setting. Every
+  other key is the shim's. It is edited here, before exec, because the shim
+  writes settings such as the last volume back to it while running.
+- scripts/hifiberry-volume.lua: a symlink to the packaged volume script.
+- users.json is jellyfin-setup's: never read, created or written here.
+
+It also creates the artwork cache base under /tmp world-readable before the
+shim can create it 0700, so audiocontrol (another user) can read the covers.
+
+--dry-run prints what would be done as JSON and changes nothing.
+
+Every device path can be redirected through the environment, for tests:
+JELLYFIN_CONF_DIR, JELLYFIN_DRM_ROOT, JELLYFIN_MODEL_FILE, XDG_RUNTIME_DIR,
+JELLYFIN_CONFIG_SERVER, JELLYFIN_CACHE_ROOT, JELLYFIN_SHARE_DIR,
+JELLYFIN_VOLUME_SCRIPT, JELLYFIN_SHIM.
+"""
+
+import json
+import os
+import re
+import socket
+import stat
+import subprocess
+import sys
+import tempfile
+import urllib.error
+import urllib.request
+
+SHARE_DIR = os.environ.get("JELLYFIN_SHARE_DIR", "/usr/share/hifiberry-jellyfin")
+CONF_DIR = os.environ.get(
+    "JELLYFIN_CONF_DIR",
+    os.path.join(os.path.expanduser("~"), ".config", "jellyfin-mpv-shim"))
+DRM_ROOT = os.environ.get("JELLYFIN_DRM_ROOT", "/sys/class/drm")
+MODEL_FILE = os.environ.get("JELLYFIN_MODEL_FILE", "/proc/device-tree/model")
+CONFIG_SERVER = os.environ.get("JELLYFIN_CONFIG_SERVER", "http://127.0.0.1:1081")
+# Must match XDG_CACHE_HOME in jellyfin.service (this directory + /.cache).
+CACHE_ROOT = os.environ.get("JELLYFIN_CACHE_ROOT", "/tmp/jellyfin-mpv-shim")
+VOLUME_SCRIPT = os.environ.get(
+    "JELLYFIN_VOLUME_SCRIPT", os.path.join(SHARE_DIR, "scripts", "hifiberry-volume.lua"))
+SHIM = os.environ.get("JELLYFIN_SHIM", "/usr/lib/hifiberry-jellyfin/venv/bin/jellyfin-mpv-shim")
+
+UNLIMITED_REMOTE_KEY = "player.jellyfin.unlimited_remote"
+CONFIGDB_TIMEOUT = 3
+
+# The display controller. On a Pi 4 v3d is also a DRM card, but render-only;
+# naming it as drm-device gives no picture.
+DISPLAY_DRIVER = "vc4-drm"
+
+# Hardware decoding per Pi generation. Pi 4: drm-copy is the stateless HEVC
+# decoder, v4l2m2m-copy the H.264 one (measured: 1440x1080 HEVC ~250% CPU in
+# software, ~44% with drm-copy). Pi 5 has the HEVC decoder only. Any other
+# model (Pi 3, Zero 2) gets no entry and plays audio only: software video is
+# too slow there to be worth a picture that stutters.
+HWDEC = {
+    "4": "drm-copy,v4l2m2m-copy",
+    "5": "drm-copy",
+}
+
+# jellyfin-mpv-shim's own defaults for the bitrate caps (conf.py).
+SHIM_DEFAULT_LOCAL_KBPS = 2147483
+SHIM_DEFAULT_REMOTE_KBPS = 10000
+
+OWNED_KEYS = {
+    "enable_gui": False,
+    "headless": True,
+    "close_to_tray": False,
+    "media_keys": False,
+}
+
+
+def log(message):
+    print(f"start-jellyfin: {message}", file=sys.stderr, flush=True)
+
+
+# --- hardware ---------------------------------------------------------------
+
+def pi_generation():
+    """'4', '5', ... from the device tree model, or None if not a numbered Pi."""
+    try:
+        with open(MODEL_FILE, "rb") as f:
+            model = f.read().rstrip(b"\0").decode(errors="replace").strip()
+    except OSError:
+        return None
+    # "Raspberry Pi 4 Model B", "Raspberry Pi 400", "Raspberry Pi Compute
+    # Module 4", "Raspberry Pi 5 Model B", "Raspberry Pi 500" ... but not
+    # "Raspberry Pi Zero 2 W", whose digit is not the generation.
+    match = re.match(r"Raspberry Pi (?:Compute Module )?(\d)", model)
+    return match.group(1) if match else None
+
+
+def live_wayland_socket():
+    """Name of a Wayland socket in XDG_RUNTIME_DIR that a compositor answers on.
+
+    Kiosk mode's cage runs as the player user, so its socket is in our runtime
+    dir. A socket file left behind by a compositor that died is not enough:
+    mpv would fail to open it and the cast would get no picture.
+    """
+    runtime = os.environ.get("XDG_RUNTIME_DIR")
+    if not runtime:
+        return None
+    try:
+        names = sorted(os.listdir(runtime))
+    except OSError:
+        return None
+    for name in names:
+        if not re.fullmatch(r"wayland-\d+", name):
+            continue
+        path = os.path.join(runtime, name)
+        try:
+            if not stat.S_ISSOCK(os.stat(path).st_mode):
+                continue
+        except OSError:
+            continue
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(1)
+        try:
+            s.connect(path)
+        except OSError:
+            continue
+        finally:
+            s.close()
+        return name
+    return None
+
+
+def _read(path):
+    try:
+        with open(path) as f:
+            return f.read()
+    except OSError:
+        return ""
+
+
+def hdmi_display_card():
+    """The display controller card (e.g. 'card1') with a connected HDMI port."""
+    try:
+        entries = os.listdir(DRM_ROOT)
+    except OSError:
+        return None
+    cards = sorted((e for e in entries if re.fullmatch(r"card\d+", e)),
+                   key=lambda e: int(e[4:]))
+    for card in cards:
+        uevent = _read(os.path.join(DRM_ROOT, card, "device", "uevent"))
+        if f"DRIVER={DISPLAY_DRIVER}" not in uevent.split():
+            continue
+        for entry in sorted(entries):
+            if not entry.startswith(f"{card}-HDMI-"):
+                continue
+            if _read(os.path.join(DRM_ROOT, entry, "status")).strip() == "connected":
+                return card
+    return None
+
+
+def choose_output():
+    """(template, hwdec, drm_device, wayland_display)."""
+    hwdec = HWDEC.get(pi_generation())
+    if hwdec is None:
+        return "audio", None, None, None
+    wayland = live_wayland_socket()
+    if wayland:
+        return "wayland", hwdec, None, wayland
+    card = hdmi_display_card()
+    if card:
+        return "drm", hwdec, f"/dev/dri/{card}", None
+    return "audio", hwdec, None, None
+
+
+def mpv_conf_text(template, hwdec, drm_device):
+    with open(os.path.join(SHARE_DIR, f"mpv.conf.{template}")) as f:
+        text = f.read()
+    if not text.endswith("\n"):
+        text += "\n"
+    header = (f"# Written by start-jellyfin from mpv.conf.{template} on every start\n"
+              "# of the player; changes made here are lost.\n")
+    extra = ""
+    if drm_device:
+        extra += f"drm-device={drm_device}\n"
+    if hwdec:
+        extra += f"hwdec={hwdec}\n"
+    return header + text + extra
+
+
+# --- settings ---------------------------------------------------------------
+
+def _first_line(cmd):
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    if out.returncode != 0:
+        return ""
+    lines = out.stdout.strip().splitlines()
+    return lines[0].strip() if lines else ""
+
+
+def player_name():
+    """The device name, from the same source the other players advertise."""
+    return (_first_line(["hostnamectl", "hostname", "--pretty"])
+            or _first_line(["hostname"])
+            or "HiFiBerry")
+
+
+def unlimited_remote():
+    """The "Full quality over VPN" toggle. Unset or unreachable means off."""
+    url = f"{CONFIG_SERVER}/api/v1/key/{UNLIMITED_REMOTE_KEY}"
+    try:
+        with urllib.request.urlopen(url, timeout=CONFIGDB_TIMEOUT) as response:
+            payload = json.loads(response.read().decode())
+    except urllib.error.HTTPError as exc:
+        if exc.code != 404:
+            log(f"ConfigDB answered {exc.code} for {UNLIMITED_REMOTE_KEY}; "
+                "keeping the remote bitrate cap")
+        return False
+    except Exception as exc:  # noqa: BLE001 - any transport failure
+        log(f"ConfigDB unreachable ({exc}); keeping the remote bitrate cap")
+        return False
+    if not isinstance(payload, dict) or payload.get("status") != "success":
+        return False
+    value = (payload.get("data") or {}).get("value")
+    return str(value).strip().lower() in ("true", "1", "yes", "on")
+
+
+def load_conf(path):
+    """(conf dict, corrupt). A missing file is a fresh install: {}."""
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        return {}, False
+    except (OSError, ValueError):
+        return {}, True
+    if not isinstance(data, dict):
+        return {}, True
+    return data, False
+
+
+def conf_updates(conf, name, unlimited):
+    updates = dict(OWNED_KEYS, player_name=name)
+    local = conf.get("local_kbps", SHIM_DEFAULT_LOCAL_KBPS)
+    if unlimited:
+        # The shim counts only RFC 1918 servers as local; a server reached
+        # over a VPN is "remote" and would be transcoded down to 10 Mbit/s.
+        updates["remote_kbps"] = local
+    elif "remote_kbps" in conf and conf["remote_kbps"] == local:
+        # Equal to local_kbps is what turning the setting on leaves behind:
+        # it has been turned off since, so put the shim's cap back.
+        updates["remote_kbps"] = SHIM_DEFAULT_REMOTE_KBPS
+    return updates
+
+
+# --- files ------------------------------------------------------------------
+
+def write_atomic(path, text, mode=0o644):
+    directory = os.path.dirname(path)
+    fd, tmp = tempfile.mkstemp(dir=directory, prefix=".start-jellyfin-")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(text)
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def ensure_public_dir(path):
+    """A directory of ours, mode 0755, refusing anything planted in its place.
+
+    /tmp is shared: a symlink or another user's directory at this path would
+    otherwise get the shim's artwork, or have us chmod someone else's files.
+    """
+    try:
+        os.mkdir(path, 0o755)
+    except FileExistsError:
+        pass
+    st = os.lstat(path)
+    if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.geteuid():
+        raise RuntimeError(f"{path} exists and is not a directory owned by this user")
+    os.chmod(path, 0o755)
+
+
+def ensure_symlink(link, target):
+    try:
+        if os.readlink(link) == target:
+            return
+    except OSError:
+        pass
+    tmp = f"{link}.start-jellyfin-tmp"
+    try:
+        os.unlink(tmp)
+    except FileNotFoundError:
+        pass
+    os.symlink(target, tmp)
+    os.replace(tmp, link)
+
+
+def main(argv):
+    dry_run = "--dry-run" in argv[1:]
+
+    template, hwdec, drm_device, wayland = choose_output()
+    mpv_conf = mpv_conf_text(template, hwdec, drm_device)
+
+    conf_path = os.path.join(CONF_DIR, "conf.json")
+    conf, corrupt = load_conf(conf_path)
+    updates = conf_updates(conf, player_name(), unlimited_remote())
+
+    env = dict(os.environ)
+    env.pop("WAYLAND_DISPLAY", None)
+    if wayland:
+        env["WAYLAND_DISPLAY"] = wayland
+
+    if dry_run:
+        print(json.dumps({
+            "template": template,
+            "hwdec": hwdec,
+            "drm_device": drm_device,
+            "env": {"WAYLAND_DISPLAY": wayland},
+            "conf": updates,
+            "mpv_conf": mpv_conf,
+        }, indent=2))
+        return 0
+
+    ensure_public_dir(CACHE_ROOT)
+    ensure_public_dir(os.path.join(CACHE_ROOT, ".cache"))
+
+    # users.json in here holds the server token.
+    os.makedirs(CONF_DIR, mode=0o700, exist_ok=True)
+    os.makedirs(os.path.join(CONF_DIR, "scripts"), exist_ok=True)
+
+    write_atomic(os.path.join(CONF_DIR, "mpv.conf"), mpv_conf)
+
+    if corrupt:
+        os.replace(conf_path, conf_path + ".corrupt")
+        log("conf.json was not valid JSON; moved it to conf.json.corrupt")
+    conf.update(updates)
+    write_atomic(conf_path, json.dumps(conf, indent=4) + "\n")
+
+    ensure_symlink(os.path.join(CONF_DIR, "scripts", "hifiberry-volume.lua"), VOLUME_SCRIPT)
+
+    log(f"mpv template {template}"
+        + (f", {drm_device}" if drm_device else "")
+        + (f", WAYLAND_DISPLAY={wayland}" if wayland else "")
+        + (f", hwdec={hwdec}" if hwdec else ""))
+
+    os.execve(SHIM, [SHIM, "--no-gui"], env)
+    return 1  # not reached
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv))
+    except Exception as exc:  # noqa: BLE001 - one clear line in the journal
+        log(f"error: {exc}")
+        sys.exit(1)

@@ -1,0 +1,8 @@
+# Kiosk mode is running: render as a full-screen client of its compositor
+# instead of taking the display from it. start-jellyfin exports
+# WAYLAND_DISPLAY and adds hwdec= for the Pi model.
+vo=gpu
+gpu-context=wayland
+fullscreen=yes
+ao=pipewire
+profile=fast

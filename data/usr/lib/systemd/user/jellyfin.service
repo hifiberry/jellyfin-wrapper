@@ -1,0 +1,23 @@
+[Unit]
+Description=Jellyfin cast target (jellyfin-mpv-shim)
+After=sound.target network-online.target pipewire.service
+Wants=network-online.target jellyfin-setup.service
+
+[Service]
+Type=simple
+# The shim publishes MPRIS on the "session" bus it finds here. Pointing that
+# at the system bus is what lets audiocontrol, which runs as its own user,
+# see the player -- the same arrangement as shairport-sync.
+Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/dbus/system_bus_socket
+# Artwork goes under $XDG_CACHE_HOME/jellyfin-mpv-shim/mpris, which
+# audiocontrol reads. start-jellyfin creates /tmp/jellyfin-mpv-shim and its
+# .cache 0755 first; the player user's home is not readable to it.
+Environment=XDG_CACHE_HOME=/tmp/jellyfin-mpv-shim/.cache
+ExecStart=/usr/bin/start-jellyfin
+Restart=on-failure
+# Well under StartLimitIntervalSec (10s), so five failed starts in a row do
+# trip the default start limit instead of retrying for ever.
+RestartSec=2
+
+[Install]
+WantedBy=default.target

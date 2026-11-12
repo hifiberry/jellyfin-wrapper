@@ -1,0 +1,11 @@
+/build/
+*.deb
+*.buildinfo
+*.changes
+__pycache__/
+.pytest_cache/
+debian/hifiberry-jellyfin/
+debian/.debhelper/
+debian/debhelper-build-stamp
+debian/files
+debian/*.substvars

@@ -1,0 +1,6 @@
+# No display connected, or a model without usable video decoding: play the
+# sound of every cast and skip the picture.
+vo=null
+vid=no
+ao=pipewire
+profile=fast

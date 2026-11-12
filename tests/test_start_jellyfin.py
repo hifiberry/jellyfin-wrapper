@@ -1,0 +1,533 @@
+"""Tests for scripts/start-jellyfin.
+
+start-jellyfin is run as a subprocess against a temporary tree, the way the
+player unit runs it. Every path it touches on a device is redirected by an
+environment variable, ConfigDB is a stub HTTP server on loopback, and the
+shim it execs is a stand-in that records its argv and environment, so
+nothing here needs a display, a sound card or the vendored venv.
+"""
+import http.server
+import json
+import os
+import pathlib
+import shutil
+import socket
+import stat
+import subprocess
+import sys
+import tempfile
+import threading
+
+import pytest
+
+REPO = pathlib.Path(__file__).resolve().parent.parent
+SCRIPT = REPO / "scripts" / "start-jellyfin"
+SHARE = REPO / "data" / "usr" / "share" / "hifiberry-jellyfin"
+
+PI4 = "Raspberry Pi 4 Model B Rev 1.4"
+PI5 = "Raspberry Pi 5 Model B Rev 1.0"
+PI3 = "Raspberry Pi 3 Model B Plus Rev 1.3"
+
+FAKE_SHIM = """#!/bin/sh
+{
+  printf '%s\\n' "$@"
+  printf 'WAYLAND_DISPLAY=%s\\n' "${WAYLAND_DISPLAY-<unset>}"
+} > "$FAKE_SHIM_OUT"
+"""
+
+
+class ConfigDB:
+    """A loopback stand-in for config-server's /api/v1/key/<key>."""
+
+    def __init__(self, values):
+        self.values = values
+        self.requests = []
+        outer = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                outer.requests.append(self.path)
+                prefix = "/api/v1/key/"
+                key = self.path[len(prefix):] if self.path.startswith(prefix) else None
+                if key not in outer.values:
+                    self.send_response(404)
+                    self.end_headers()
+                    self.wfile.write(b'{"status":"error"}')
+                    return
+                body = json.dumps({"status": "success",
+                                   "data": {"key": key, "value": outer.values[key]}})
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(body.encode())
+
+            def log_message(self, *args):
+                pass
+
+        self.server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        self.url = f"http://127.0.0.1:{self.server.server_port}"
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+
+    def close(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+
+def unused_port_url():
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    return f"http://127.0.0.1:{port}"
+
+
+class Tree:
+    """A fake device: model file, DRM sysfs, runtime dir, home, cache root."""
+
+    def __init__(self, root):
+        self.root = root
+        self.conf_dir = root / "home" / ".config" / "jellyfin-mpv-shim"
+        self.drm = root / "sys" / "class" / "drm"
+        self.drm.mkdir(parents=True)
+        self.model_file = root / "model"
+        # A unix socket path must stay under ~104 bytes (macOS), which a
+        # pytest tmp_path does not; the runtime dir gets its own short one.
+        self.runtime = pathlib.Path(tempfile.mkdtemp(prefix="jf", dir="/tmp"))
+        self.cache_root = root / "tmp" / "jellyfin-mpv-shim"
+        self.cache_root.parent.mkdir()
+        self.bin = root / "bin"
+        self.bin.mkdir()
+        self.shim = self.bin / "fake-shim"
+        self.shim.write_text(FAKE_SHIM)
+        self.shim.chmod(0o755)
+        self.shim_out = root / "shim-out"
+        self.volume_target = root / "share" / "scripts" / "hifiberry-volume.lua"
+        self.configdb = None
+        self.configdb_url = unused_port_url()
+        self.listeners = []
+        self.set_model(PI4)
+        self.fake_command("hostnamectl", 'echo "Living Room"')
+        self.fake_command("hostname", 'echo "hifiberry"')
+
+    def cleanup(self):
+        for s in self.listeners:
+            s.close()
+        if self.configdb:
+            self.configdb.close()
+        shutil.rmtree(self.runtime, ignore_errors=True)
+
+    def set_model(self, model):
+        # The device tree's model string is NUL-terminated.
+        self.model_file.write_bytes(model.encode() + b"\0")
+
+    def fake_command(self, name, body):
+        path = self.bin / name
+        path.write_text(f"#!/bin/sh\n{body}\n")
+        path.chmod(0o755)
+
+    def add_card(self, n, driver, connectors=()):
+        card = self.drm / f"card{n}"
+        (card / "device").mkdir(parents=True)
+        (card / "device" / "uevent").write_text(f"DRIVER={driver}\nOF_NAME=gpu\n")
+        for name, status in connectors:
+            conn = self.drm / f"card{n}-{name}"
+            conn.mkdir()
+            (conn / "status").write_text(status + "\n")
+
+    def wayland_socket(self, name="wayland-0", listening=True):
+        path = self.runtime / name
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.bind(str(path))
+        if listening:
+            s.listen(16)
+            self.listeners.append(s)
+        else:
+            s.close()  # leaves a stale socket file behind, as a dead cage would
+        return path
+
+    def set_configdb(self, values):
+        self.configdb = ConfigDB(values)
+        self.configdb_url = self.configdb.url
+
+    def env(self):
+        return {
+            "PATH": str(self.bin),
+            "HOME": str(self.root / "home"),
+            "JELLYFIN_CONF_DIR": str(self.conf_dir),
+            "JELLYFIN_DRM_ROOT": str(self.drm),
+            "JELLYFIN_MODEL_FILE": str(self.model_file),
+            "XDG_RUNTIME_DIR": str(self.runtime),
+            "JELLYFIN_CONFIG_SERVER": self.configdb_url,
+            "JELLYFIN_CACHE_ROOT": str(self.cache_root),
+            "JELLYFIN_SHARE_DIR": str(SHARE),
+            "JELLYFIN_VOLUME_SCRIPT": str(self.volume_target),
+            "JELLYFIN_SHIM": str(self.shim),
+            "FAKE_SHIM_OUT": str(self.shim_out),
+        }
+
+    def run(self, *args, extra_env=None):
+        env = self.env()
+        env.update(extra_env or {})
+        return subprocess.run([sys.executable, str(SCRIPT), *args], env=env,
+                              capture_output=True, text=True, timeout=30)
+
+    def plan(self):
+        result = self.run("--dry-run")
+        assert result.returncode == 0, result.stderr
+        return json.loads(result.stdout)
+
+    def start(self):
+        result = self.run()
+        assert result.returncode == 0, result.stderr
+        return result
+
+    def shim_record(self):
+        return self.shim_out.read_text().splitlines()
+
+    def mpv_conf(self):
+        return (self.conf_dir / "mpv.conf").read_text()
+
+    def conf_json(self):
+        return json.loads((self.conf_dir / "conf.json").read_text())
+
+
+@pytest.fixture
+def tree(tmp_path):
+    t = Tree(tmp_path)
+    yield t
+    t.cleanup()
+
+
+def mpv_options(text):
+    """mpv.conf as {option: value}, comments and blank lines dropped."""
+    opts = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        key, _, value = line.partition("=")
+        opts[key] = value
+    return opts
+
+
+# --- template selection -----------------------------------------------------
+
+def test_template_wayland_when_cage_socket_present(tree):
+    tree.add_card(1, "vc4-drm", [("HDMI-A-1", "connected")])
+    tree.wayland_socket("wayland-0")
+
+    plan = tree.plan()
+    assert plan["template"] == "wayland"
+    assert plan["env"]["WAYLAND_DISPLAY"] == "wayland-0"
+
+    tree.start()
+    opts = mpv_options(tree.mpv_conf())
+    assert opts["vo"] == "gpu"
+    assert opts["gpu-context"] == "wayland"
+    assert opts["fullscreen"] == "yes"
+    assert "drm-device" not in opts
+    assert "WAYLAND_DISPLAY=wayland-0" in tree.shim_record()
+
+
+def test_stale_wayland_socket_is_not_kiosk_mode(tree):
+    tree.add_card(1, "vc4-drm", [("HDMI-A-1", "connected")])
+    tree.wayland_socket("wayland-0", listening=False)
+    (tree.runtime / "wayland-0.lock").write_text("")
+
+    assert tree.plan()["template"] == "drm"
+
+
+def test_wayland_display_not_inherited_without_cage(tree):
+    tree.add_card(1, "vc4-drm", [("HDMI-A-1", "disconnected")])
+    result = tree.run(extra_env={"WAYLAND_DISPLAY": "wayland-9"})
+    assert result.returncode == 0, result.stderr
+    assert "WAYLAND_DISPLAY=<unset>" in tree.shim_record()
+
+
+def test_template_drm_when_hdmi_connected(tree):
+    # card0 is the render-only v3d; the display controller must be found by
+    # driver, not assumed to be card0 or card1.
+    tree.add_card(0, "v3d")
+    tree.add_card(1, "vc4-drm", [("HDMI-A-1", "connected"), ("HDMI-A-2", "disconnected")])
+
+    assert tree.plan()["template"] == "drm"
+
+    tree.start()
+    opts = mpv_options(tree.mpv_conf())
+    assert opts["vo"] == "gpu"
+    assert opts["gpu-context"] == "drm"
+    assert opts["drm-device"] == "/dev/dri/card1"
+
+
+def test_template_drm_finds_card_by_driver(tree):
+    tree.add_card(0, "vc4-drm", [("HDMI-A-1", "connected")])
+    tree.add_card(1, "v3d")
+
+    tree.start()
+    assert mpv_options(tree.mpv_conf())["drm-device"] == "/dev/dri/card0"
+
+
+def test_template_audio_only_without_display(tree):
+    tree.add_card(0, "v3d")
+    tree.add_card(1, "vc4-drm", [("HDMI-A-1", "disconnected"), ("HDMI-A-2", "disconnected")])
+
+    assert tree.plan()["template"] == "audio"
+
+    tree.start()
+    opts = mpv_options(tree.mpv_conf())
+    assert opts["vo"] == "null"
+    assert opts["vid"] == "no"
+    assert "drm-device" not in opts
+
+
+def test_template_audio_only_without_drm_at_all(tree):
+    assert tree.plan()["template"] == "audio"
+
+
+def test_all_templates_use_pipewire_and_fast_profile(tree):
+    for name in ("drm", "wayland", "audio"):
+        opts = mpv_options((SHARE / f"mpv.conf.{name}").read_text())
+        assert opts["ao"] == "pipewire", name
+        assert opts["profile"] == "fast", name
+
+
+def test_mpv_conf_replaced_on_every_start(tree):
+    tree.add_card(1, "vc4-drm", [("HDMI-A-1", "connected")])
+    tree.conf_dir.mkdir(parents=True)
+    (tree.conf_dir / "mpv.conf").write_text("vo=x11\nmy-own-option=1\n")
+
+    tree.start()
+    opts = mpv_options(tree.mpv_conf())
+    assert opts["vo"] == "gpu"
+    assert "my-own-option" not in opts
+
+
+# --- hardware decoding by model ---------------------------------------------
+
+def test_hwdec_pi4(tree):
+    tree.set_model(PI4)
+    tree.add_card(1, "vc4-drm", [("HDMI-A-1", "connected")])
+    tree.start()
+    assert mpv_options(tree.mpv_conf())["hwdec"] == "drm-copy,v4l2m2m-copy"
+
+
+def test_hwdec_pi5(tree):
+    tree.set_model(PI5)
+    tree.add_card(1, "vc4-drm", [("HDMI-A-1", "connected")])
+    tree.start()
+    assert mpv_options(tree.mpv_conf())["hwdec"] == "drm-copy"
+
+
+@pytest.mark.parametrize("model", ["Raspberry Pi 400 Rev 1.0",
+                                   "Raspberry Pi Compute Module 4 Rev 1.0"])
+def test_pi4_family(tree, model):
+    tree.set_model(model)
+    tree.add_card(1, "vc4-drm", [("HDMI-A-1", "connected")])
+    plan = tree.plan()
+    assert plan["template"] == "drm"
+    assert plan["hwdec"] == "drm-copy,v4l2m2m-copy"
+
+
+@pytest.mark.parametrize("model", [PI3, "Raspberry Pi Zero 2 W Rev 1.0", ""])
+def test_other_models_are_audio_only(tree, model):
+    tree.set_model(model)
+    tree.add_card(1, "vc4-drm", [("HDMI-A-1", "connected")])
+    tree.wayland_socket("wayland-0")
+    plan = tree.plan()
+    assert plan["template"] == "audio"
+    assert plan["hwdec"] is None
+
+
+def test_missing_model_file_is_audio_only(tree):
+    tree.model_file.unlink()
+    tree.add_card(1, "vc4-drm", [("HDMI-A-1", "connected")])
+    assert tree.plan()["template"] == "audio"
+
+
+# --- conf.json --------------------------------------------------------------
+
+OWNED = {
+    "enable_gui": False,
+    "headless": True,
+    "close_to_tray": False,
+    "media_keys": False,
+    "player_name": "Living Room",
+}
+
+
+def write_conf(tree, data):
+    tree.conf_dir.mkdir(parents=True, exist_ok=True)
+    (tree.conf_dir / "conf.json").write_text(json.dumps(data, indent=4))
+
+
+def test_conf_json_owned_keys(tree):
+    write_conf(tree, {"enable_gui": True, "headless": False, "close_to_tray": True,
+                      "media_keys": True, "player_name": "old", "fullscreen": False,
+                      "local_kbps": 50000, "remote_kbps": 10000, "volume": 42})
+    tree.start()
+    conf = tree.conf_json()
+    for key, value in OWNED.items():
+        assert conf[key] == value, key
+    # The shim's own keys are left alone.
+    assert conf["fullscreen"] is False
+    assert conf["volume"] == 42
+    assert conf["local_kbps"] == 50000
+    assert conf["remote_kbps"] == 10000
+
+
+def test_conf_json_created_on_fresh_install(tree):
+    tree.start()
+    assert tree.conf_json() == OWNED
+
+
+def test_unlimited_remote_on_copies_local_kbps(tree):
+    tree.set_configdb({"player.jellyfin.unlimited_remote": "true"})
+    write_conf(tree, {"local_kbps": 50000, "remote_kbps": 10000})
+    tree.start()
+    assert tree.conf_json()["remote_kbps"] == 50000
+    assert "/api/v1/key/player.jellyfin.unlimited_remote" in tree.configdb.requests
+
+
+def test_unlimited_remote_on_fresh_install_uses_shim_default(tree):
+    tree.set_configdb({"player.jellyfin.unlimited_remote": "true"})
+    tree.start()
+    conf = tree.conf_json()
+    assert conf["remote_kbps"] == 2147483
+
+
+def test_unlimited_remote_off_keeps_remote_cap(tree):
+    tree.set_configdb({"player.jellyfin.unlimited_remote": "false"})
+    write_conf(tree, {"local_kbps": 50000, "remote_kbps": 10000})
+    tree.start()
+    assert tree.conf_json()["remote_kbps"] == 10000
+
+
+def test_unlimited_remote_turned_off_restores_cap(tree):
+    # Turned on earlier (remote_kbps was copied from local_kbps), now off.
+    tree.set_configdb({"player.jellyfin.unlimited_remote": "false"})
+    write_conf(tree, {"local_kbps": 50000, "remote_kbps": 50000})
+    tree.start()
+    assert tree.conf_json()["remote_kbps"] == 10000
+
+
+def test_unlimited_remote_unset_is_off(tree):
+    tree.set_configdb({})
+    write_conf(tree, {"local_kbps": 50000, "remote_kbps": 50000})
+    tree.start()
+    assert tree.conf_json()["remote_kbps"] == 10000
+
+
+def test_unlimited_remote_configdb_unreachable_is_off(tree):
+    # tree.configdb_url points at a port nothing listens on.
+    write_conf(tree, {"local_kbps": 50000, "remote_kbps": 10000})
+    tree.start()
+    assert tree.conf_json()["remote_kbps"] == 10000
+
+
+def test_dry_run_reports_conf_keys(tree):
+    tree.set_configdb({"player.jellyfin.unlimited_remote": "true"})
+    write_conf(tree, {"local_kbps": 50000, "remote_kbps": 10000})
+    plan = tree.plan()
+    assert plan["conf"] == dict(OWNED, remote_kbps=50000)
+
+
+def test_corrupt_conf_json_is_set_aside(tree):
+    tree.conf_dir.mkdir(parents=True)
+    (tree.conf_dir / "conf.json").write_text("{not json")
+    tree.start()
+    assert tree.conf_json() == OWNED
+    assert (tree.conf_dir / "conf.json.corrupt").read_text() == "{not json"
+
+
+# --- player name ------------------------------------------------------------
+
+def test_player_name_falls_back_to_hostname(tree):
+    tree.fake_command("hostnamectl", "exit 1")
+    tree.start()
+    assert tree.conf_json()["player_name"] == "hifiberry"
+
+
+def test_player_name_falls_back_to_hifiberry(tree):
+    tree.fake_command("hostnamectl", "echo")
+    tree.fake_command("hostname", "exit 1")
+    tree.start()
+    assert tree.conf_json()["player_name"] == "HiFiBerry"
+
+
+# --- files around the shim --------------------------------------------------
+
+def test_cache_dirs_created_0755(tree):
+    tree.start()
+    for path in (tree.cache_root, tree.cache_root / ".cache"):
+        assert path.is_dir(), path
+        assert stat.S_IMODE(path.stat().st_mode) == 0o755, path
+
+
+def test_cache_dirs_permissions_repaired(tree):
+    (tree.cache_root / ".cache").mkdir(parents=True)
+    tree.cache_root.chmod(0o700)
+    (tree.cache_root / ".cache").chmod(0o700)
+    tree.start()
+    for path in (tree.cache_root, tree.cache_root / ".cache"):
+        assert stat.S_IMODE(path.stat().st_mode) == 0o755, path
+
+
+def test_cache_root_symlink_refused(tree):
+    elsewhere = tree.root / "elsewhere"
+    elsewhere.mkdir()
+    tree.cache_root.symlink_to(elsewhere)
+    result = tree.run()
+    assert result.returncode != 0
+    assert not tree.shim_out.exists()
+
+
+def test_volume_script_symlinked(tree):
+    tree.start()
+    link = tree.conf_dir / "scripts" / "hifiberry-volume.lua"
+    assert link.is_symlink()
+    assert os.readlink(link) == str(tree.volume_target)
+
+
+def test_volume_script_symlink_replaces_stale_entry(tree):
+    scripts = tree.conf_dir / "scripts"
+    scripts.mkdir(parents=True)
+    (scripts / "hifiberry-volume.lua").write_text("-- an old copy\n")
+    (scripts / "other.lua").write_text("-- not ours\n")
+    tree.start()
+    link = scripts / "hifiberry-volume.lua"
+    assert link.is_symlink()
+    assert os.readlink(link) == str(tree.volume_target)
+    assert (scripts / "other.lua").read_text() == "-- not ours\n"
+
+
+def test_users_json_untouched(tree):
+    tree.conf_dir.mkdir(parents=True)
+    users = tree.conf_dir / "users.json"
+    content = b'[{"credentials": [{"address": "http://192.0.2.10:8096"}]}]'
+    users.write_bytes(content)
+    os.utime(users, (1_000_000_000, 1_000_000_000))
+    tree.start()
+    assert users.read_bytes() == content
+    assert users.stat().st_mtime == 1_000_000_000
+
+
+def test_users_json_not_created(tree):
+    tree.start()
+    assert not (tree.conf_dir / "users.json").exists()
+
+
+# --- exec -------------------------------------------------------------------
+
+def test_execs_shim_without_gui(tree):
+    tree.start()
+    record = tree.shim_record()
+    assert record[0] == "--no-gui"
+
+
+def test_dry_run_writes_nothing(tree):
+    tree.add_card(1, "vc4-drm", [("HDMI-A-1", "connected")])
+    tree.plan()
+    assert not tree.conf_dir.exists()
+    assert not tree.cache_root.exists()
+    assert not tree.shim_out.exists()

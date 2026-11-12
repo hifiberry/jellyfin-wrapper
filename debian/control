@@ -1,0 +1,20 @@
+Source: hifiberry-jellyfin
+Section: sound
+Priority: optional
+Maintainer: HiFiBerry <support@hifiberry.com>
+Build-Depends: debhelper-compat (= 13), python3, python3-pip, python3-pytest
+Standards-Version: 4.6.0
+Homepage: https://github.com/hifiberry/jellyfin-wrapper
+
+Package: hifiberry-jellyfin
+Architecture: all
+Depends: ${misc:Depends}, ${venv:Python},
+ python3-gi, gir1.2-glib-2.0, python3-pil, libmpv2
+Description: Jellyfin cast target for HiFiBerryOS
+ Makes the device a playback target for Jellyfin: cast music, movies and
+ series to it from any Jellyfin app. Audio plays through the normal
+ HiFiBerryOS audio path; video plays full-screen on HDMI when a display is
+ connected.
+ .
+ Runs jellyfin-mpv-shim, which is included in this package together with
+ the Python libraries it needs.

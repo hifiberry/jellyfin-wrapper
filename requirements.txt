@@ -1,0 +1,34 @@
+# jellyfin-mpv-shim and everything it needs to run headless, vendored into
+# /usr/lib/hifiberry-jellyfin/venv at package build time (debian/rules).
+#
+# Only pure-Python wheels (py3-none-any), so the package stays
+# Architecture: all; the build fails if a compiled module lands in the venv.
+# Installed with --no-deps --require-hashes: this list is the complete set.
+#
+# Deliberately left out:
+# - pillow: compiled. The shim imports it only for the GUI library browser
+#   and trickplay thumbnails, both lazily. The venv is created with
+#   --system-site-packages, so Debian's python3-pil provides it.
+# - charset-normalizer ships compiled wheels too; the hash below is its
+#   pure-Python py3-none-any wheel.
+# - pystray, pypresence: extras for the tray icon and Discord, not used.
+jellyfin-mpv-shim==3.3.0 \
+    --hash=sha256:4d9236b464d5369922552d06a1313e8e7bfa0dfde53610ccb59291e6e3d5edcc
+jellyfin-apiclient-python==1.21.0 \
+    --hash=sha256:0ea9c4a3023420a3010920260970cd61bc51a8b9dba44158ed2357e59cb4d730
+python-mpv==1.0.8 \
+    --hash=sha256:b5296403e990fb7348df4ca2211937a030f524bf638657bda7e45a00bc2df0cd
+python-mpv-jsonipc==1.5.0 \
+    --hash=sha256:f9ce720a07a005c6e37b3eacccffe220ad73cf5d5b0aa9dd77dbe8578be4f249
+requests==2.34.2 \
+    --hash=sha256:2a0d60c172f83ac6ab31e4554906c0f3b3588d37b5cb939b1c061f4907e278e0
+urllib3==2.8.0 \
+    --hash=sha256:0cf3cae568d36aa9576b28dfb35f11328f1cb974ca7647d9475ebb86c75ac6e3
+idna==3.20 \
+    --hash=sha256:ab7ae7122974553370f0bdb919e1a960b2cd1bc1ef0276416d896db81c14582c
+charset-normalizer==3.5.2 \
+    --hash=sha256:b6b751274acb69d77b3323d6b7dbaa3c7fdfc1eb829b7eb61d262f32e1af9685
+certifi==2026.10.23 \
+    --hash=sha256:e9b54de76e530bb6cf0ccd036787103acb58fd42ba930ea8bf948ddbaa2f61d1
+websocket-client==1.9.2 \
+    --hash=sha256:e1a673830a9c7bfa47b1cd3d5e4178f4c9651d80a4eab02c9c23a1c3ec6250ce

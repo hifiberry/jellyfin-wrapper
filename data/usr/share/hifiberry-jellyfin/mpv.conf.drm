@@ -1,0 +1,7 @@
+# Video on the HDMI display, straight to KMS (no X11, no Wayland).
+# start-jellyfin adds drm-device= for the vc4-drm display controller it
+# found, and hwdec= for the Pi model.
+vo=gpu
+gpu-context=drm
+ao=pipewire
+profile=fast

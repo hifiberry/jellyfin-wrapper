@@ -1,0 +1,67 @@
+#!/usr/bin/make -f
+export DEB_BUILD_MAINT_OPTIONS = hardening=+all
+
+PKG := hifiberry-jellyfin
+DEST := debian/$(PKG)
+VENV_PATH := /usr/lib/hifiberry-jellyfin/venv
+VENV := $(DEST)$(VENV_PATH)
+PYVER := $(shell python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])')
+PYNEXT := $(shell python3 -c 'import sys; print("%d.%d" % (sys.version_info[0], sys.version_info[1] + 1))')
+
+%:
+	dh $@
+
+override_dh_auto_build:
+
+override_dh_auto_test:
+	# Self-contained: start-jellyfin runs against a temporary tree with a
+	# loopback ConfigDB stub and a stand-in for the shim, so no network, no
+	# display and no sound card are involved.
+	python3 -m pytest tests/ -v
+
+# The venv is built here rather than in dh_auto_build because dh_prep, at
+# the start of the install sequence, empties debian/$(PKG)/.
+override_dh_auto_install:
+	mkdir -p $(DEST)
+	cp -r data/* $(DEST)/
+	install -D -m0755 scripts/start-jellyfin $(DEST)/usr/bin/start-jellyfin
+	# The shim and its dependencies, pinned and hash-checked. pip runs from
+	# the build host and installs into a venv that has no pip of its own, so
+	# none ends up on the device. --system-site-packages gives the shim
+	# Debian's python3-gi (MPRIS) and python3-pil.
+	python3 -m venv --without-pip --system-site-packages $(VENV)
+	python3 -m pip --python $(VENV)/bin/python install \
+		--no-deps --require-hashes --only-binary=:all: \
+		--no-compile --no-cache-dir --disable-pip-version-check \
+		-r requirements.txt
+	# Architecture: all is only honest while every file is pure Python.
+	@so=$$(find $(VENV) -name '*.so' -o -name '*.so.*'); \
+	if [ -n "$$so" ]; then \
+		echo "ERROR: compiled modules in the venv; the package would not be Architecture: all:" >&2; \
+		echo "$$so" >&2; exit 1; \
+	fi
+	# The venv was created at its build-tree path; point it at the installed
+	# one (script shebangs, activate scripts, pyvenv.cfg's command line).
+	grep -rlI -F '$(CURDIR)/$(DEST)' $(VENV) | xargs -r sed -i 's|$(CURDIR)/$(DEST)||g'
+	@left=$$(grep -rlI -F '$(DEST)$(VENV_PATH)' $(VENV)); \
+	if [ -n "$$left" ]; then \
+		echo "ERROR: build paths left in the venv:" >&2; echo "$$left" >&2; exit 1; \
+	fi
+	head -1 $(VENV)/bin/jellyfin-mpv-shim | grep -qx '#!$(VENV_PATH)/bin/python3\?'
+	# Smoke test: the vendored packages import. (mpv itself loads libmpv,
+	# a runtime dependency rather than a build one, so it is not imported.)
+	# -B, so the check itself writes no __pycache__ into the package.
+	$(VENV)/bin/python -B -c 'import jellyfin_mpv_shim, jellyfin_apiclient_python, requests, websocket, certifi'
+	@pyc=$$(find $(VENV) -name '__pycache__' -o -name '*.pyc'); \
+	if [ -n "$$pyc" ]; then \
+		echo "ERROR: byte-code in the venv:" >&2; echo "$$pyc" >&2; exit 1; \
+	fi
+	# The venv is tied to this Python minor version (lib/pythonX.Y).
+	echo 'venv:Python=python3 (>= $(PYVER)~), python3 (<< $(PYNEXT))' >> debian/$(PKG).substvars
+
+# jellyfin.service is the WebUI-toggleable player, like every other
+# HiFiBerryOS player: it ships disabled and the user turns it on from
+# Services > Players. Shipping it enabled would start a cast target that
+# nobody has signed in yet on every boot.
+override_dh_installsystemduser:
+	dh_installsystemduser --no-enable jellyfin.service

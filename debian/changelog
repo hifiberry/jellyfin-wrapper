@@ -1,0 +1,15 @@
+hifiberry-jellyfin (0.1.0) trixie; urgency=medium
+
+  * Initial package: jellyfin-mpv-shim as a Jellyfin cast target.
+    - jellyfin-mpv-shim 3.3.0 and its pure-Python dependencies, pinned by
+      hash, in /usr/lib/hifiberry-jellyfin/venv; nothing is downloaded on
+      the device
+    - start-jellyfin prepares the shim's configuration on every start: the
+      mpv template for the hardware (Wayland under kiosk mode, KMS on a
+      connected HDMI display, audio only otherwise), hardware decoding for
+      the Pi 4 and Pi 5, a headless conf.json named after the device, the
+      remote bitrate cap from player.jellyfin.unlimited_remote, and the
+      artwork cache audiocontrol reads
+    - jellyfin.service, a systemd --user unit, disabled by default
+
+ -- HiFiBerry <support@hifiberry.com>  Thu, 12 Nov 2026 12:00:00 +0000
