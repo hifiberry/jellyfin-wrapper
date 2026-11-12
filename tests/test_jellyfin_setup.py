@@ -178,13 +178,23 @@ def closed_port_url():
     return f"http://127.0.0.1:{port}"
 
 
+# Logs its arguments; on stop/start/restart it also keeps a copy of
+# users.json as it is at that moment ("<verb>.json", or "<verb>.missing").
 FAKE_SYSTEMCTL = """#!/bin/sh
 printf '%s\\n' "$*" >> "$FAKE_SYSTEMCTL_LOG"
-case "$*" in
-  *is-active*) exit "$(cat "$FAKE_SYSTEMCTL_ACTIVE_RC")" ;;
+case "$2" in
+  is-active) exit "$(cat "$FAKE_SYSTEMCTL_ACTIVE_RC")" ;;
+  stop|start|restart)
+    cp "$FAKE_USERS_JSON" "$FAKE_SNAPSHOTS/$2.json" 2>/dev/null || : > "$FAKE_SNAPSHOTS/$2.missing"
+    [ "$2" = stop ] && exit "$(cat "$FAKE_SYSTEMCTL_STOP_RC")" ;;
 esac
 exit 0
 """
+
+IS_ACTIVE = "--user is-active --quiet jellyfin.service"
+STOP = "--user stop jellyfin.service"
+START = "--user start jellyfin.service"
+RESTART = "--user restart jellyfin.service"
 
 
 class Clock:
@@ -227,6 +237,13 @@ class Env:
         self.set_active(active)
         monkeypatch.setenv("FAKE_SYSTEMCTL_LOG", str(self.systemctl_log))
         monkeypatch.setenv("FAKE_SYSTEMCTL_ACTIVE_RC", str(self.active_rc))
+        self.stop_rc = tmp_path / "stop-rc"
+        self.stop_rc.write_text("0")
+        monkeypatch.setenv("FAKE_SYSTEMCTL_STOP_RC", str(self.stop_rc))
+        self.snapshots = tmp_path / "snapshots"
+        self.snapshots.mkdir()
+        monkeypatch.setenv("FAKE_SNAPSHOTS", str(self.snapshots))
+        monkeypatch.setenv("FAKE_USERS_JSON", str(self.users_path))
 
         self.clock = Clock()
         self.service = js.SetupService(
@@ -247,6 +264,14 @@ class Env:
 
     def systemctl_calls(self):
         return self.systemctl_log.read_text().splitlines()
+
+    def snapshot(self, verb):
+        """users.json as it was when systemctl <verb> ran (None: missing)."""
+        path = self.snapshots / f"{verb}.json"
+        if path.exists():
+            return json.loads(path.read_text())
+        assert (self.snapshots / f"{verb}.missing").exists(), f"no systemctl {verb}"
+        return None
 
     def call(self, method, path, timeout=10):
         request = urllib.request.Request(self.url + path, method=method,
@@ -347,6 +372,37 @@ def test_status_signed_in(make_env):
     assert "FAKE-TOKEN" not in json.dumps(body)
 
 
+def test_status_credential_for_other_server_is_not_signed_in(make_env):
+    users = fixture_json("users.signed-in.json")  # server A at 192.0.2.10
+    users["users"][0]["credentials"][0]["Id"] = "a" * 32
+    env = make_env(users=users)
+    env.configdb.values["player.jellyfin.server"] = env.jellyfin.url  # server B
+    _, body = env.call("GET", "/status")
+    assert body["logged_in"] is False
+    assert body["sign_in"]["account"] is None
+    assert body["sign_in"]["server_name"] is None
+    assert body["sign_in"]["ready"] is True
+
+
+def test_status_credential_matches_by_server_id(make_env):
+    users = fixture_json("users.signed-in.json")
+    # Same server (same Id) stored under another address.
+    users["users"][0]["credentials"][0]["address"] = "http://jellyfin.example.invalid:8096"
+    env = make_env(users=users)
+    env.configdb.values["player.jellyfin.server"] = env.jellyfin.url
+    _, body = env.call("GET", "/status")
+    assert body["logged_in"] is True
+    assert body["sign_in"]["account"] == "alice"
+    assert body["sign_in"]["server_name"] == "Home"
+
+
+def test_status_signed_in_but_no_server_chosen(make_env):
+    env = make_env(users=fixture_json("users.signed-in.json"))
+    _, body = env.call("GET", "/status")
+    assert body["logged_in"] is False
+    assert body["sign_in"]["ready"] is False
+
+
 def test_status_signed_in_server_offline_uses_stored_name(make_env):
     env = make_env(users=fixture_json("users.signed-in.json"))  # 192.0.2.10
     env.service.server_timeout = 0.5
@@ -429,18 +485,34 @@ def test_initiate_server_unreachable(make_env):
     assert body == {"error": "Server not reachable"}
 
 
-def test_initiate_creates_users_json(make_env):
+def test_initiate_writes_nothing(make_env):
+    users = fixture_json("users.fresh.json")
+    env = make_env(users=users)
+    env.configdb.values["player.jellyfin.server"] = env.jellyfin.url
+    before = env.users_path.read_bytes(), env.users_path.stat().st_mtime_ns
+    assert env.call("POST", "/login")[0] == 200
+    assert env.call("GET", "/login")[1]["state"] == "waiting"
+    assert (env.users_path.read_bytes(), env.users_path.stat().st_mtime_ns) == before
+    assert sorted(p.name for p in env.conf_dir.iterdir()) == ["users.json"]
+    assert env.systemctl_calls() == []
+
+
+def test_users_json_created_with_the_credential(make_env):
     env = make_env()
     env.configdb.values["player.jellyfin.server"] = env.jellyfin.url
     status, _ = env.call("POST", "/login")
     assert status == 200
+    assert not env.conf_dir.exists()  # nothing on disk before sign-in completes
+    env.jellyfin.authenticated = True
+    assert env.call("GET", "/login")[1]["state"] == "approved"
     users = env.users()
     fresh = fixture_json("users.fresh.json")
     assert set(users) == set(fresh)
     user = users["users"][0]
     assert set(user) == set(fresh["users"][0])
     assert users["active"] == user["id"]
-    assert user["credentials"] == [] and user["default"] is True
+    assert [c["AccessToken"] for c in user["credentials"]] == [TOKEN]
+    assert user["default"] is True
     assert user["name"] == "(default)"
     import uuid
     assert uuid.UUID(user["id"]).version == 4
@@ -448,8 +520,22 @@ def test_initiate_creates_users_json(make_env):
     assert user["id"] != user["device_id"]
     assert stat.S_IMODE(env.users_path.stat().st_mode) == 0o600
     assert stat.S_IMODE(env.conf_dir.stat().st_mode) == 0o700
-    auth = env.jellyfin.calls("POST", "/QuickConnect/Initiate")[0]["headers"]["Authorization"]
-    assert f'DeviceId="{user["device_id"]}"' in auth
+    for request in env.jellyfin.requests:
+        assert f'DeviceId="{user["device_id"]}"' in request["headers"]["Authorization"]
+
+
+def test_users_json_appearing_meanwhile_with_other_device_id_fails(make_env):
+    env = make_env(active=True)
+    env.configdb.values["player.jellyfin.server"] = env.jellyfin.url
+    env.call("POST", "/login")
+    # The shim started meanwhile and created its own users.json.
+    env.conf_dir.mkdir(parents=True)
+    env.users_path.write_text(json.dumps(fixture_json("users.fresh.json")))
+    env.jellyfin.authenticated = True
+    body = env.call("GET", "/login")[1]
+    assert body["state"] == "failed" and body["error"]
+    assert env.users() == fixture_json("users.fresh.json")
+    assert env.systemctl_calls() == [IS_ACTIVE, STOP, START]
 
 
 def test_poll_approved_writes_users_json(make_env):
@@ -460,7 +546,7 @@ def test_poll_approved_writes_users_json(make_env):
     assert env.call("POST", "/login")[0] == 200
     assert env.call("GET", "/login")[1]["state"] == "waiting"
     assert not env.users()["users"][0]["credentials"]
-    assert "restart" not in "".join(env.systemctl_calls())
+    assert env.systemctl_calls() == []
 
     env.jellyfin.authenticated = True
     status, body = env.call("GET", "/login")
@@ -487,9 +573,10 @@ def test_poll_approved_writes_users_json(make_env):
     assert json.loads(auth_call["body"]) == {"Secret": SECRET}
     for request in env.jellyfin.requests:
         assert 'DeviceId="00000000-0000-4000-8000-0000000000d1"' in request["headers"]["Authorization"]
-    assert any(c.endswith("restart jellyfin") or "restart" in c and "jellyfin" in c
-               for c in env.systemctl_calls())
-    assert env.systemctl_calls()[0].startswith("--user ")
+    # Stopped before users.json was written, started after.
+    assert env.systemctl_calls() == [IS_ACTIVE, STOP, START]
+    assert env.snapshot("stop")["users"][0]["credentials"] == []
+    assert env.snapshot("start") == saved
 
     # Further polls do not authenticate again.
     assert env.call("GET", "/login")[1]["state"] == "approved"
@@ -507,7 +594,19 @@ def test_poll_approved_player_inactive_no_restart(make_env):
     env.jellyfin.authenticated = True
     assert env.call("GET", "/login")[1]["state"] == "approved"
     assert env.users()["users"][0]["credentials"]
-    assert not [c for c in env.systemctl_calls() if "restart" in c]
+    assert env.systemctl_calls() == [IS_ACTIVE]
+
+
+def test_poll_approved_player_does_not_stop(make_env):
+    env = make_env(users=fixture_json("users.fresh.json"), active=True)
+    env.stop_rc.write_text("1")
+    env.configdb.values["player.jellyfin.server"] = env.jellyfin.url
+    env.call("POST", "/login")
+    env.jellyfin.authenticated = True
+    assert env.call("GET", "/login")[1]["state"] == "approved"
+    # Written anyway, then a restart, so the player at least reads it.
+    assert env.systemctl_calls() == [IS_ACTIVE, STOP, RESTART]
+    assert env.snapshot("restart")["users"][0]["credentials"][0]["AccessToken"] == TOKEN
 
 
 def test_poll_approved_replaces_credential_for_same_server(make_env):
@@ -612,7 +711,9 @@ def test_logout_removes_credentials(make_env):
     logout = env.jellyfin.calls("POST", "/Sessions/Logout")
     assert len(logout) == 1
     assert 'Token="FAKE-TOKEN-0000000000000000000000"' in logout[0]["headers"]["Authorization"]
-    assert [c for c in env.systemctl_calls() if "restart" in c]
+    assert env.systemctl_calls() == [IS_ACTIVE, STOP, START]
+    assert env.snapshot("stop")["users"][0]["credentials"]
+    assert env.snapshot("start")["users"][0]["credentials"] == []
     _, body = env.call("GET", "/status")
     assert body["logged_in"] is False
 
@@ -625,7 +726,15 @@ def test_logout_server_unreachable_still_removes(make_env):
     status, _ = env.call("POST", "/logout")
     assert status == 200
     assert env.users()["users"][0]["credentials"] == []
-    assert not [c for c in env.systemctl_calls() if "restart" in c]
+    assert env.systemctl_calls() == [IS_ACTIVE]
+
+
+def test_logout_not_signed_in_leaves_player_alone(make_env):
+    env = make_env(users=fixture_json("users.fresh.json"), active=True)
+    before = env.users_path.read_bytes()
+    assert env.call("POST", "/logout")[0] == 200
+    assert env.users_path.read_bytes() == before
+    assert env.systemctl_calls() == []
 
 
 def test_logout_without_users_json(make_env):
@@ -658,6 +767,25 @@ def test_no_token_in_any_response_or_log(make_env, caplog):
         assert secret not in responses
         assert secret not in logs
         assert secret not in env.systemctl_log.read_text()
+
+
+def test_auth_header_values_are_encoded(js):
+    header = js.auth_header('Kitchen, "upstairs"', "d1")
+    assert 'Device="Kitchen%2C %22upstairs%22"' in header
+    assert header.count('="') == 4  # Client, Device, DeviceId, Version
+
+
+def test_server_supplied_names_logged_escaped(make_env, caplog):
+    caplog.set_level(logging.DEBUG)
+    env = make_env(users=fixture_json("users.fresh.json"), active=False)
+    env.configdb.values["player.jellyfin.server"] = env.jellyfin.url
+    env.jellyfin.routes[("POST", "/Users/AuthenticateWithQuickConnect")] = lambda r: (200, {
+        "AccessToken": TOKEN, "User": {"Id": USER_ID, "Name": "alice\nforged line"}})
+    env.call("POST", "/login")
+    env.jellyfin.authenticated = True
+    assert env.call("GET", "/login")[1]["state"] == "approved"
+    assert "forged line" in caplog.text
+    assert not any("\n" in record.getMessage() for record in caplog.records)
 
 
 # --- discovery --------------------------------------------------------------

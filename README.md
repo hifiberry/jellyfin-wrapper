@@ -95,7 +95,7 @@ Quick Connect, so nobody has to type a password on the device. nginx forwards
 
 | Request | Answer |
 | --- | --- |
-| `GET /status` | `logged_in`, `is_active` (is `jellyfin.service` running), `device_name`, `version`, and `sign_in`: `{method: "quick_connect", account, server_name, ready, reason}`. `ready` is false, with `reason` "Choose a server first.", while no server is set. |
+| `GET /status` | `logged_in`, `is_active` (is `jellyfin.service` running), `device_name`, `version`, and `sign_in`: `{method: "quick_connect", account, server_name, ready, reason}`. `logged_in`, `account` and `server_name` describe the credential for the server chosen now (same address, or same server id); one for another server does not count. `ready` is false, with `reason` "Choose a server first.", while no server is set. |
 | `GET /servers` | Servers found on the LAN, `[{id, name, address}]`. config-server uses it for the server drop-down. |
 | `POST /login` | Starts Quick Connect: `{code, expires_in: 300}`. 409 when no server is set or Quick Connect is disabled on the server, 502 when the server does not answer. |
 | `GET /login` | `{state, code, error}`, `state` one of `idle`, `waiting`, `approved`, `expired`, `failed`. Each poll asks the server whether the code was entered; once it was, the credentials are stored. |
@@ -113,9 +113,15 @@ Quick Connect, so nobody has to type a password on the device. nginx forwards
   `--quick-connect` writes, replacing any earlier entry for the same server.
   Jellyfin ties a token to the device id it was issued for, so every request
   to the server carries `users.json`'s `device_id`; when there is no
-  `users.json` yet, one is created with a new device id. After signing in or
-  out, `jellyfin.service` is restarted if it is running, so the shim picks up
-  the change.
+  `users.json` yet, a new device id is chosen and the file is created together
+  with the credential. Starting a sign-in writes nothing.
+- **The player is stopped while `users.json` changes.** The shim keeps its
+  users in memory and writes `users.json` itself, so a file rewritten under a
+  running shim can be overwritten again: a new sign-in lost, a removed one
+  back. After signing in or out, `jellyfin-setup` checks whether
+  `jellyfin.service` is running; if so it stops it (waiting up to 30 s),
+  writes the file, and starts it again. A player that is not running is left
+  alone. A player that fails to stop gets the file anyway, then a restart.
 - **Secrets**: the Quick Connect secret and the access token are never
   logged, never returned by any request and never passed on a command line;
   `users.json` is mode 0600 in a 0700 directory.

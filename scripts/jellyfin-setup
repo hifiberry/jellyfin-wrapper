@@ -10,7 +10,7 @@ Run by jellyfin-setup.service as the HiFiBerryOS player user, listening on
   POST   /login    start Quick Connect: {code, expires_in}
   GET    /login    poll it: {state, code, error}
   DELETE /login    cancel it
-  POST   /logout   revoke the token, drop the credentials, restart the player
+  POST   /logout   revoke the token, drop the credentials
 
 The server comes from ConfigDB, read on every request:
 player.jellyfin.server_url (typed in by hand) wins over player.jellyfin.server
@@ -19,8 +19,13 @@ player.jellyfin.server_url (typed in by hand) wins over player.jellyfin.server
 Sign-in writes the credentials into the shim's users.json in the shape the
 shim's own --quick-connect leaves there. Jellyfin binds the token to the
 device id it was issued for, so every request to the server carries the
-device_id from users.json; a users.json that does not exist yet is created
-with a new one.
+device_id from users.json; when there is no users.json yet, a new device id
+is chosen and the file is created with the credential. Nothing is written
+before the sign-in completes.
+
+The shim keeps its users in memory and writes users.json itself, so the file
+is only rewritten while the player is stopped: if jellyfin.service is
+running it is stopped, users.json written, and the player started again.
 
 The Quick Connect secret and the access token stay in this process and in
 users.json (mode 0600). They are never logged, never returned, and never
@@ -31,6 +36,7 @@ JELLYFIN_SYSTEMCTL_CMD, JELLYFIN_DISCOVERY_TARGET (host:port).
 """
 
 import argparse
+import contextlib
 import datetime
 import http.client
 import http.server
@@ -65,6 +71,9 @@ SERVER_INFO_TTL = 60        # how long that name is reused
 SERVER_INFO_FAIL_TTL = 30   # how long an unreachable server is not asked again
 
 LOGIN_EXPIRES_IN = 300
+
+# Long enough for a normal shutdown of the shim.
+PLAYER_STOP_TIMEOUT = 30
 
 DISCOVERY_MESSAGE = b"who is JellyfinServer?"
 DISCOVERY_TARGET = ("255.255.255.255", 7359)
@@ -118,7 +127,8 @@ def player_name():
 def _header_value(value):
     # Header values are latin-1 on the wire; Jellyfin URL-decodes them, which
     # is how its own clients send names outside ASCII.
-    return urllib.parse.quote(str(value), safe=" !#$&'()*+,-./:;<=>?@[]^_`{|}~")
+    # ',' too: the header is a comma-separated list of key="value" pairs.
+    return urllib.parse.quote(str(value), safe=" !#$&'()*+-./:;<=>?@[]^_`{|}~")
 
 
 # --- server address ---------------------------------------------------------
@@ -267,33 +277,44 @@ class UsersFile:
         os.makedirs(self.dir, mode=0o700, exist_ok=True)
         write_atomic(self.path, json.dumps(data, indent=4) + "\n")
 
-    def ensure(self):
-        """(data, active user), creating users.json or its user if needed."""
+    def identity(self):
+        """(user id, device id) the next sign-in will use. Writes nothing.
+
+        Taken from users.json when it has them; otherwise new ones, which
+        only reach the disk together with the credential.
+        """
         data, state = self.load()
-        changed = False
+        user = active_user(data) if state == "ok" else None
+        if user and user.get("id") and user.get("device_id"):
+            return user["id"], user["device_id"]
+        return (user or {}).get("id") or str(uuid.uuid4()), str(uuid.uuid4())
+
+    def prepare(self, user_id, device_id):
+        """(data, active user) to add a credential to, in memory only.
+
+        None if users.json now carries a different device id than the one
+        the sign-in was made with: the token would not fit it.
+        """
+        data, state = self.load()
         if state == "corrupt":
             os.replace(self.path, self.path + ".corrupt")
             log.warning("users.json was not readable; moved it to users.json.corrupt")
         if state != "ok":
             data = {"users": []}
-            changed = True
         user = active_user(data)
         if user is None:
-            user = fresh_user()
+            user = dict(fresh_user(), id=user_id, device_id=device_id)
             data["users"].append(user)
             data["active"] = user["id"]
-            changed = True
+        if not user.get("device_id"):
+            user["device_id"] = device_id
+        if user["device_id"] != device_id:
+            return None
         if not isinstance(user.get("credentials"), list):
             user["credentials"] = []
-            changed = True
-        if not user.get("device_id"):
-            user["device_id"] = str(uuid.uuid4())
-            changed = True
-        if changed:
-            data.setdefault("active", user["id"])
-            # Key order as the shim writes it.
-            data = {"active": data["active"], **{k: v for k, v in data.items() if k != "active"}}
-            self.save(data)
+        data.setdefault("active", user["id"])
+        # Key order as the shim writes it.
+        data = {"active": data["active"], **{k: v for k, v in data.items() if k != "active"}}
         return data, active_user(data)
 
 
@@ -349,9 +370,10 @@ def server_request(base, method, path, *, authorization, body=None, timeout=SERV
 # --- the service ------------------------------------------------------------
 
 class Pending:
-    def __init__(self, server, info, device_id, secret, code, started):
+    def __init__(self, server, info, user_id, device_id, secret, code, started):
         self.server = server
         self.info = info
+        self.user_id = user_id
         self.device_id = device_id
         self.secret = secret
         self.code = code
@@ -453,10 +475,10 @@ class SetupService:
 
     # -- systemd
 
-    def _systemctl(self, *args):
+    def _systemctl(self, *args, timeout=10):
         try:
             return subprocess.run([*self.systemctl, *args], capture_output=True,
-                                  timeout=10).returncode
+                                  timeout=timeout).returncode
         except (OSError, subprocess.SubprocessError) as exc:
             log.warning("systemctl %s failed: %s", args[0], exc)
             return None
@@ -464,10 +486,31 @@ class SetupService:
     def player_active(self):
         return self._systemctl("is-active", "--quiet", "jellyfin.service") == 0
 
-    def restart_player_if_active(self):
-        if self.player_active():
-            log.info("restarting the player for the new credentials")
-            self._systemctl("restart", "--no-block", "jellyfin.service")
+    @contextlib.contextmanager
+    def player_stopped(self):
+        """Keep the player stopped while users.json is rewritten.
+
+        The shim holds its users in memory and writes users.json itself, so
+        a file changed under a running shim can be overwritten again: a new
+        credential lost, a removed one back. Stop it, let the caller write,
+        start it again if it was running.
+        """
+        was_active = self.player_active()
+        stopped = True
+        if was_active:
+            log.info("stopping the player to update its sign-in")
+            stopped = self._systemctl("stop", "jellyfin.service",
+                                      timeout=PLAYER_STOP_TIMEOUT) == 0
+            if not stopped:
+                log.warning("the player did not stop; updating its sign-in anyway")
+        try:
+            yield
+        finally:
+            if was_active:
+                # A player that would not stop gets a restart, so it at least
+                # reads the new file.
+                self._systemctl("start" if stopped else "restart", "jellyfin.service",
+                                timeout=PLAYER_STOP_TIMEOUT)
 
     # -- server info
 
@@ -481,41 +524,49 @@ class SetupService:
             return None
         return info
 
-    def _cached_server_name(self, base, device_id):
+    def _cached_server_info(self, base, device_id):
         now = self.clock()
         cached = self.info_cache.get(base)
         if cached:
             when, info = cached
             if now - when < (SERVER_INFO_TTL if info else SERVER_INFO_FAIL_TTL):
-                return info.get("ServerName") if info else None
+                return info
         try:
             info = self._server_info(base, device_id, min(STATUS_INFO_TIMEOUT, self.server_timeout))
         except Unreachable:
             info = None
         self.info_cache[base] = (now, info)
-        return info.get("ServerName") if info else None
+        return info
 
     # -- endpoints
 
     def status(self):
         server = self.server_address()
         data, state = self.users.load()
-        credential, device_id = None, ""
-        if state == "ok":
+        creds, device_id = [], ""
+        if state == "ok" and server is not None:
             user = active_user(data)
             if user:
                 device_id = user.get("device_id") or ""
                 creds = [c for c in user.get("credentials") or []
                          if isinstance(c, dict) and c.get("AccessToken")]
-                matching = [c for c in creds if normalise_address(c.get("address")) == server]
-                credential = (matching or creds or [None])[0]
+
+        # Signed in means: to the server that is chosen now. A credential
+        # for another server does not count. It matches by address, or by
+        # server id when the same server is reached by another address.
+        credential = info = None
+        if creds:
+            info = self._cached_server_info(server, device_id)
+            for cred in creds:
+                if (normalise_address(cred.get("address")) == server
+                        or (info and cred.get("Id") == info.get("Id"))):
+                    credential = cred
+                    break
 
         account = server_name = None
         if credential:
             account = credential.get("username")
-            address = normalise_address(credential.get("address"))
-            live = self._cached_server_name(address, device_id) if address else None
-            server_name = live or credential.get("Name")
+            server_name = (info or {}).get("ServerName") or credential.get("Name")
 
         return {
             "binary_installed": True,
@@ -541,32 +592,29 @@ class SetupService:
             raise HTTPFailure(409, NO_SERVER)
         with self.lock:
             self.pending = None
-            try:
-                _, user = self.users.ensure()
-            except OSError as exc:
-                log.error("could not write users.json: %s", exc)
-                raise HTTPFailure(500, "Could not save the sign-in data") from None
-            device_id = user["device_id"]
+            # Nothing is written yet: users.json changes only once, with the
+            # credential, while the player is stopped.
+            user_id, device_id = self.users.identity()
             try:
                 info = self._server_info(server, device_id, self.server_timeout)
                 if info is None:
-                    log.warning("%s did not answer as a Jellyfin server", server)
+                    log.warning("%r did not answer as a Jellyfin server", server)
                     raise HTTPFailure(502, NOT_REACHABLE)
                 status, payload = server_request(server, "POST", "/QuickConnect/Initiate",
                                                  authorization=self._auth(device_id),
                                                  timeout=self.server_timeout)
             except Unreachable as exc:
-                log.warning("%s not reachable (%s)", server, exc)
+                log.warning("%r not reachable (%s)", server, exc)
                 raise HTTPFailure(502, NOT_REACHABLE) from None
             if status in (401, 403):
                 raise HTTPFailure(409, QC_DISABLED)
             if (status != 200 or not isinstance(payload, dict)
                     or not payload.get("Secret") or not payload.get("Code")):
-                log.warning("Quick Connect not started on %s (HTTP %s)", server, status)
+                log.warning("Quick Connect not started on %r (HTTP %s)", server, status)
                 raise HTTPFailure(502, "The server did not start Quick Connect")
-            self.pending = Pending(server, info, device_id, payload["Secret"],
+            self.pending = Pending(server, info, user_id, device_id, payload["Secret"],
                                    str(payload["Code"]), self.clock())
-            log.info("Quick Connect started on %s", server)
+            log.info("Quick Connect started on %r", server)
             return {"code": self.pending.code, "expires_in": LOGIN_EXPIRES_IN}
 
     def poll_login(self):
@@ -607,17 +655,25 @@ class SetupService:
         user_info = payload.get("User") if isinstance(payload, dict) else None
         token = payload.get("AccessToken") if isinstance(payload, dict) else None
         if status != 200 or not token or not isinstance(user_info, dict) or not user_info.get("Id"):
-            log.warning("sign-in refused by %s (HTTP %s)", pending.server, status)
+            log.warning("sign-in refused by %r (HTTP %s)", pending.server, status)
             pending.finish("failed", "The server refused the sign-in.")
             return
 
+        with self.player_stopped():
+            self._store(pending, user_info, token)
+        if pending.state == "approved":
+            self.info_cache.pop(pending.server, None)
+            log.info("signed in as %r on %r", user_info.get("Name"), pending.server)
+
+    def _store(self, pending, user_info, token):
         try:
-            data, user = self.users.ensure()
-            if user["device_id"] != pending.device_id:
+            prepared = self.users.prepare(pending.user_id, pending.device_id)
+            if prepared is None:
                 # users.json was replaced while the code was pending; the
-                # token belongs to a device id the shim no longer uses.
+                # token belongs to a device id the shim does not use.
                 pending.finish("failed", "Sign-in data changed meanwhile. Start again.")
                 return
+            data, user = prepared
             info = pending.info
             credential = {
                 "address": pending.server,
@@ -641,9 +697,6 @@ class SetupService:
             pending.finish("failed", "Could not save the sign-in data.")
             return
         pending.finish("approved")
-        self.info_cache.pop(pending.server, None)
-        log.info("signed in as %s on %s", user_info.get("Name"), pending.server)
-        self.restart_player_if_active()
 
     def cancel_login(self):
         with self.lock:
@@ -651,29 +704,34 @@ class SetupService:
         return {"state": "idle", "code": None, "error": None}
 
     def logout(self):
-        removed = False
         with self.lock:
             self.pending = None
-            data, state = self.users.load()
-            if state == "ok":
-                for user in data["users"]:
-                    if not isinstance(user, dict):
-                        continue
-                    for cred in user.get("credentials") or []:
-                        self._revoke(cred, user.get("device_id") or "")
-                        removed = True
-                    user["credentials"] = []
-                if removed:
+            self.info_cache.clear()
+            if not self._has_credentials():
+                return {"logged_in": False}
+            with self.player_stopped():
+                # Read again now that the shim has stopped and written its
+                # last state.
+                data, state = self.users.load()
+                if state == "ok":
+                    for user in data["users"]:
+                        if not isinstance(user, dict):
+                            continue
+                        for cred in user.get("credentials") or []:
+                            self._revoke(cred, user.get("device_id") or "")
+                        user["credentials"] = []
                     try:
                         self.users.save(data)
                     except OSError as exc:
                         log.error("could not write users.json: %s", exc)
                         raise HTTPFailure(500, "Could not remove the sign-in data") from None
-            self.info_cache.clear()
-        if removed:
             log.info("signed out")
-            self.restart_player_if_active()
         return {"logged_in": False}
+
+    def _has_credentials(self):
+        data, state = self.users.load()
+        return state == "ok" and any(
+            isinstance(user, dict) and user.get("credentials") for user in data["users"])
 
     def _revoke(self, cred, device_id):
         """Best effort: the token is dropped locally either way."""
@@ -686,9 +744,9 @@ class SetupService:
                                        authorization=self._auth(device_id, token),
                                        timeout=self.server_timeout)
             if status >= 300:
-                log.info("%s did not revoke the token (HTTP %s)", address, status)
+                log.info("%r did not revoke the token (HTTP %s)", address, status)
         except Unreachable:
-            log.info("%s not reachable; token dropped locally only", address)
+            log.info("%r not reachable; token dropped locally only", address)
 
 
 # --- HTTP -------------------------------------------------------------------
@@ -739,7 +797,7 @@ def make_server(service, host, port):
 
         def log_request(self, code="-", size="-"):
             path = urllib.parse.urlsplit(self.path).path
-            log.debug("%s %s %s", self.command, path, code)
+            log.debug("%s %r %s", self.command, path, code)
 
         def log_error(self, format, *args):
             log.warning(format, *args)
