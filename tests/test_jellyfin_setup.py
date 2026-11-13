@@ -502,6 +502,25 @@ def test_initiate_server_unreachable(make_env):
     assert body == {"error": "Server not reachable"}
 
 
+def test_initiate_server_name_not_resolvable(make_env, monkeypatch):
+    # A name that only resolves elsewhere (a VPN's DNS, the browser's
+    # machine): say so, instead of a generic "not reachable".
+    real_getaddrinfo = socket.getaddrinfo
+
+    def getaddrinfo(host, *args, **kwargs):
+        if host == "jellyfin-box.invalid":
+            raise socket.gaierror(socket.EAI_NONAME, "Name or service not known")
+        return real_getaddrinfo(host, *args, **kwargs)
+
+    monkeypatch.setattr(socket, "getaddrinfo", getaddrinfo)
+    env = make_env(users=fixture_json("users.fresh.json"))
+    env.configdb.values["player.jellyfin.server"] = "http://jellyfin-box.invalid:8096"
+    status, body = env.call("POST", "/login")
+    assert status == 502
+    assert body == {"error": "This device can't find 'jellyfin-box.invalid' on the network. "
+                             "Use the server's IP address instead."}
+
+
 def test_initiate_writes_nothing(make_env):
     users = fixture_json("users.fresh.json")
     env = make_env(users=users)

@@ -107,6 +107,16 @@ class Unreachable(Exception):
     pass
 
 
+class Unresolvable(Unreachable):
+    """The server's host name does not resolve on this device."""
+
+
+def not_resolvable_message(server):
+    host = urllib.parse.urlsplit(server).hostname or server
+    return (f"This device can't find '{host}' on the network. "
+            "Use the server's IP address instead.")
+
+
 # --- device -----------------------------------------------------------------
 
 def _first_line(cmd):
@@ -392,6 +402,8 @@ def server_request(base, method, path, *, authorization, body=None, timeout=SERV
         status, raw = exc.code, b""
         exc.close()
     except (urllib.error.URLError, OSError, http.client.HTTPException, ValueError) as exc:
+        if isinstance(getattr(exc, "reason", exc), socket.gaierror):
+            raise Unresolvable("name not resolved") from None
         raise Unreachable(type(exc).__name__) from None
     try:
         payload = json.loads(raw) if raw else None
@@ -646,6 +658,9 @@ class SetupService:
                 status, payload = server_request(server, "POST", "/QuickConnect/Initiate",
                                                  authorization=self._auth(device_id),
                                                  timeout=self.server_timeout)
+            except Unresolvable:
+                log.warning("%r does not resolve on this device", server)
+                raise HTTPFailure(502, not_resolvable_message(server)) from None
             except Unreachable as exc:
                 log.warning("%r not reachable (%s)", server, exc)
                 raise HTTPFailure(502, NOT_REACHABLE) from None
